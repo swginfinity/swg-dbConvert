@@ -1,0 +1,62 @@
+diff --git a/MMOEngine/src/engine/core/TaskManagerImpl.cpp b/MMOEngine/src/engine/core/TaskManagerImpl.cpp
+index c87ed698..6b2ae989 100644
+--- a/MMOEngine/src/engine/core/TaskManagerImpl.cpp
++++ b/MMOEngine/src/engine/core/TaskManagerImpl.cpp
+@@ -120,6 +120,9 @@ void TaskManagerImpl::initialize(int workerCount, int schedulerCount, int ioCoun
+ 		workerCount = Math::max(8, maxCpus / 2);
+ #endif
+ 		DEFAULT_WORKER_QUEUES = workerCount;
++	} else if (workerCount < 0) {
++		// Infinity dbconvert: standalone tool mode — no worker threads needed
++		return;
+ 	}
+ 
+ 	if (DEFAULT_WORKER_THREADS_PER_QUEUE < 1) {
+@@ -413,7 +416,10 @@ void TaskManagerImpl::executeTask(Task* task) NO_THREAD_SAFETY_ANALYSIS {
+ 	if (custQueue.length()) {
+ 		executeTask(task, custQueue);
+ 	} else {
+-		taskQueues.getUnsafe(currentTaskQueue.increment() % DEFAULT_WORKER_QUEUES)->push(task);
++		if (DEFAULT_WORKER_QUEUES > 0)
++			taskQueues.getUnsafe(currentTaskQueue.increment() % DEFAULT_WORKER_QUEUES)->push(task);
++		else
++			task->run(); // Infinity dbconvert: run inline when no worker queues
+ 	}
+ }
+ 
+@@ -448,7 +454,10 @@ void TaskManagerImpl::executeTaskFront(Task* task) NO_THREAD_SAFETY_ANALYSIS {
+ 	if (custQueue.length()) {
+ 		executeTask(task, custQueue);
+ 	} else {
+-		taskQueues.get(currentTaskQueue.increment() % DEFAULT_WORKER_QUEUES)->pushFront(task);
++		if (DEFAULT_WORKER_QUEUES > 0)
++			taskQueues.get(currentTaskQueue.increment() % DEFAULT_WORKER_QUEUES)->pushFront(task);
++		else
++			task->run();
+ 	}
+ }
+ 
+@@ -461,7 +470,10 @@ void TaskManagerImpl::executeTaskRandom(Task* task) {
+ 	if (custQueue.length()) {
+ 		executeTask(task, custQueue);
+ 	} else {
+-		taskQueues.get(currentTaskQueue.increment() % DEFAULT_WORKER_QUEUES)->pushRandom(task);
++		if (DEFAULT_WORKER_QUEUES > 0)
++			taskQueues.get(currentTaskQueue.increment() % DEFAULT_WORKER_QUEUES)->pushRandom(task);
++		else
++			task->run();
+ 	}
+ }
+ 
+@@ -469,7 +481,10 @@ void TaskManagerImpl::executeTasks(const Vector<Task*>& taskList) {
+ 	if (shuttingDown)
+ 		return;
+ 
+-	taskQueues.get(currentTaskQueue.increment() % DEFAULT_WORKER_QUEUES)->pushAll(taskList);
++	if (DEFAULT_WORKER_QUEUES > 0)
++		taskQueues.get(currentTaskQueue.increment() % DEFAULT_WORKER_QUEUES)->pushAll(taskList);
++	else
++		for (int i = 0; i < taskList.size(); ++i) taskList.get(i)->run();
+ }
+ 
+ bool TaskManagerImpl::getNextExecutionTime(const Task* task, AtomicTime& nextExecutionTime) {

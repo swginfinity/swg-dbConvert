@@ -1,0 +1,25 @@
+# Build artifacts
+*.o
+*.d
+build/
+
+# Database files (don't commit actual databases)
+*.db
+*.converted
+*.progress
+dbconvert_errors.log
+
+# BDB environment
+__db.*
+log.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

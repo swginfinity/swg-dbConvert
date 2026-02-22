@@ -1,0 +1,53 @@
+diff --git a/MMOEngine/src/engine/db/ObjectDatabase.cpp b/MMOEngine/src/engine/db/ObjectDatabase.cpp
+index b79806f0..904ed6ec 100644
+--- a/MMOEngine/src/engine/db/ObjectDatabase.cpp
++++ b/MMOEngine/src/engine/db/ObjectDatabase.cpp
+@@ -86,12 +86,14 @@ int ObjectDatabase::getData(uint64 objKey, ObjectInputStream* objectData, uint32
+ 	} while (ret == DB_LOCK_DEADLOCK && i < DEADLOCK_MAX_RETRIES);
+ 
+ 	if (ret == 0) {
+-		if (!compression || compressed)
++		if (!compression || compressed) {
+ 			objectData->writeStream((const char*) data.getData(), data.getSize());
+-		else
+-			uncompress(data.getData(), data.getSize(), objectData);
++		} else if (!uncompress(data.getData(), data.getSize(), objectData)) {
++			ret = -1; // Infinity dbconvert: decompression failed, treat as error
++		}
+ 
+-		objectData->reset();
++		if (ret == 0)
++			objectData->reset();
+ 	} else if (ret != DB_NOTFOUND) {
+ 		error() << "error in ObjectDatabase::getData ret " << db_strerror(ret);
+ 
+@@ -179,10 +181,11 @@ int ObjectDatabase::getDataNoTx(uint64 objKey, ObjectInputStream* objectData, ui
+ 	ret = getDatabaseHandle()->get(nullptr, &key, &data, lockMode);
+ 
+ 	if (ret == 0) {
+-		if (!compression || compressed)
++		if (!compression || compressed) {
+ 			objectData->writeStream((const char*) data.getData(), data.getSize());
+-		else
+-			uncompress(data.getData(), data.getSize(), objectData);
++		} else if (!uncompress(data.getData(), data.getSize(), objectData)) {
++			return -1; // Infinity dbconvert: decompression failed
++		}
+ 
+ 		objectData->reset();
+ 	} else if (ret != DB_NOTFOUND) {
+@@ -276,10 +279,11 @@ bool ObjectDatabaseIterator::getNextKeyAndValue(uint64& key, ObjectInputStream*
+ 
+ 		key = *reinterpret_cast<uint64*>(this->key.getData());
+ 
+-		if (!localDatabase->hasCompressionEnabled() || compressed)
++		if (!localDatabase->hasCompressionEnabled() || compressed) {
+ 			data->writeStream((char*)this->data.getData(), this->data.getSize());
+-		else
+-			LocalDatabase::uncompress(this->data.getData(), this->data.getSize(), data);
++		} else if (!LocalDatabase::uncompress(this->data.getData(), this->data.getSize(), data)) {
++			return false; // Infinity dbconvert: decompression failed, skip record
++		}
+ 
+ 		data->reset();
+ 

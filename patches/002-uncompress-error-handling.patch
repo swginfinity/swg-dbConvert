@@ -1,0 +1,47 @@
+diff --git a/MMOEngine/src/engine/db/LocalDatabase.cpp b/MMOEngine/src/engine/db/LocalDatabase.cpp
+index e9aceeab..32f09600 100644
+--- a/MMOEngine/src/engine/db/LocalDatabase.cpp
++++ b/MMOEngine/src/engine/db/LocalDatabase.cpp
+@@ -274,7 +274,7 @@ Stream* LocalDatabase::compress(Stream* data) {
+ 	return outputStream;
+ }
+ 
+-void LocalDatabase::uncompress(void* data, uint64 size, ObjectInputStream* decompressedData) {
++bool LocalDatabase::uncompress(void* data, uint64 size, ObjectInputStream* decompressedData) {
+ 	static const int zlibChunkSize = Core::getIntProperty("BerkeleyDB.zlibChunkSize", CHUNK_SIZE);
+ 
+ 	decompressedData->reset();
+@@ -306,7 +306,7 @@ void LocalDatabase::uncompress(void* data, uint64 size, ObjectInputStream* decom
+ 
+ 				inflateEnd(&packet);
+ 
+-				return;
++				return false; // Infinity dbconvert: decompression failed
+ 			}
+ 
+ 			assert(ret == Z_OK || ret == Z_STREAM_END);
+@@ -323,9 +323,10 @@ void LocalDatabase::uncompress(void* data, uint64 size, ObjectInputStream* decom
+ 		decompressedData->reset();
+ 	} catch (...) {
+ 		Logger::console.fatal("LocalDatabase::uncompress");
++		return false;
+ 	}
+ 
+-	//free(outputData);
++	return true;
+ }
+ 
+ int LocalDatabase::getData(Stream* inputKey, ObjectInputStream* objectData, uint32 lockMode, bool compressed) {
+diff --git a/MMOEngine/src/engine/db/LocalDatabase.h b/MMOEngine/src/engine/db/LocalDatabase.h
+index 472394b8..26ea0182 100644
+--- a/MMOEngine/src/engine/db/LocalDatabase.h
++++ b/MMOEngine/src/engine/db/LocalDatabase.h
+@@ -93,7 +93,7 @@ namespace engine {
+ 	 void associate(LocalDatabase* secondaryDB, int (*callback)(DB *secondary,
+ 				     const DBT *key, const DBT *data, DBT *result));
+ 
+-	 static void uncompress(void* data, uint64 size, ObjectInputStream* decompressedData);
++	 static bool uncompress(void* data, uint64 size, ObjectInputStream* decompressedData);
+ 	 static Stream* compress(Stream* data);
+ 
+ 	 virtual bool isObjectDatabase() const {
