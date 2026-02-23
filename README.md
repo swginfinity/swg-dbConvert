@@ -98,6 +98,89 @@ Engine3 is always left clean.
 
 ---
 
+## Embedded Build (infinity2.0.0 w101 branch)
+
+If you're using the `w101` branch of `swginfinity/infinity2.0.0`, `dbconvert.cpp` is already committed to the server repo and the CMake target is pre-configured. No external scripts or patches needed.
+
+### Prerequisites
+
+- Ubuntu 24.04 (or compatible)
+- clang 19 (`clang++-19` in PATH, or symlinked to `clang++`)
+- Standard SWGEmu dependencies: `libdb5.3-dev`, `liblua5.3-dev`, `libmysqlclient-dev`, `libdb5.3-util`, etc.
+
+### Step-by-Step
+
+```bash
+# 1. Clone or pull w101
+cd /home/swgemu/workspace
+git clone git@github.com:swginfinity/infinity2.0.0.git
+cd infinity2.0.0
+git checkout w101
+git pull origin w101
+
+# 2. Initialize engine3 submodule
+cd MMOCoreORB
+git submodule update --init --recursive
+
+# 3. Create build directory and run cmake
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_C_COMPILER=clang \
+      -DCMAKE_CXX_COMPILER=clang++ \
+      -DENABLE_ERROR_ON_WARNINGS=OFF \
+      ..
+
+# 4. Build the server (core3)
+make -j24
+# Binary: ../bin/core3
+
+# 5. Build dbconvert (separate target — NOT included in make -j24)
+make dbconvert -j24
+# Binary: ../bin/dbconvert
+
+# 6. Set up databases
+cd ../bin
+cp -r /path/to/2.0.0/databases databases
+# Keep a clean backup:
+cp -r databases databases_clean
+
+# 7. Configure BDB for large datasets
+cat >> conf/config-local.lua << 'LUAEOF'
+Core3.BerkeleyDB = {
+    envMaxLocks = 10000000,
+    envMaxLockers = 10000000,
+    envMaxLockObjects = 10000000,
+}
+LUAEOF
+
+# 8. Run conversion
+./dbconvert all
+
+# 9. Start the server
+./core3
+```
+
+### Build Order Notes
+
+- `make -j24` builds **only core3**. dbconvert is `EXCLUDE_FROM_ALL` — it must be built explicitly.
+- `make dbconvert -j24` compiles the converter using the same engine3 and IDL objects as core3.
+- The `if(EXISTS)` cmake guard means the build won't break if `dbconvert.cpp` is missing — it simply won't create the target.
+- If clang 19 is installed as `clang-19`/`clang++-19`, use those paths explicitly in the cmake command.
+
+### If Conversion Fails
+
+```bash
+# Restore from clean backup
+rm -rf databases/
+cp -r databases_clean databases
+
+# Fix the issue, rebuild, retry
+cd ../build && make dbconvert -j24
+cd ../bin && ./dbconvert all
+```
+
+---
+
 ## Commands
 
 ```bash
