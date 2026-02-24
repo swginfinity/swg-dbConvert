@@ -4,11 +4,21 @@ index 670a7eab..0110f400 100755
 +++ b/MMOEngine/src/engine/orb/DistributedObjectBroker.cpp
 @@ -130,6 +130,9 @@ void DistributedObjectBroker::deploy(const String& name, DistributedObjectStub*
  }
- 
+
  Reference<DistributedObject*> DistributedObjectBroker::lookUp(const String& name) {
 +	if (objectManager == nullptr)
 +		return nullptr; // Infinity dbconvert: standalone mode, no object manager
 +
  	Locker locker(objectManager);
- 
+
  	Reference<DistributedObject*> object = namingDirectoryService->lookup(name);
+@@ -154,6 +157,9 @@ Reference<DistributedObject*> DistributedObjectBroker::lookUp(const String& name
+ }
+
+ Reference<DistributedObject*> DistributedObjectBroker::lookUp(uint64 objid) {
++	if (objectManager == nullptr)
++		return nullptr; // Infinity dbconvert: standalone mode, no object manager
++
+ 	//Locker locker(objectManager);
+
+ 	Reference<DistributedObject*> object = nullptr;

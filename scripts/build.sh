@@ -217,11 +217,11 @@ fi
 # --- Step 5: Build ---
 
 echo "[5/5] Building dbconvert..."
-echo "  Running: cmake .. && make dbconvert -j$(nproc)"
+echo "  Running: cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo .. && make dbconvert -j$(nproc)"
 echo ""
 
 cd "$BUILD_DIR"
-cmake .. 2>&1 | tail -3
+cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo .. 2>&1 | tail -3
 echo ""
 make dbconvert -j$(nproc) 2>&1
 
