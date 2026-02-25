@@ -586,20 +586,27 @@ grep -r "MANAGED_REFERENCE_LOAD.*initializeTransientMembers" src/autogen/ | wc -
 
 Should match ~325. If it's 0, re-run `patch_autogen.py`.
 
-### "LSN past end of log" error when starting core3
+### "LSN past end of log" / "Commonly caused by moving a database" when starting core3
 
-BDB log sequence numbers are stale. Run:
-
-```bash
-./dbconvert clean
+```
+BDB2506 file guilds.db has LSN 1/2012908, past end of log at 1/2325
+BDB2507 Commonly caused by moving a database from one database environment
+BDB2508 to another without clearing the database LSNs, or by removing all of
+BDB2509 the log files from a database environment
+FATAL - unable to open database with ret code Invalid argument
 ```
 
-Or manually:
+This happens after conversion because the `.db` files contain LSNs (log sequence numbers) from the dbconvert BDB environment, which don't match core3's fresh environment. The fix is to rebuild each database with `db5.3_dump | db5.3_load`, which exports the data as plain text and creates a brand new `.db` file with no environment association:
 
 ```bash
-db5.3_load -r lsn databases/*.db
-rm -f databases/log.* databases/__db.*
+cd /path/to/MMOCoreORB/bin/databases
+for f in *.db; do db5.3_dump "$f" | db5.3_load "$f.tmp" && mv "$f.tmp" "$f"; done
+rm -f __db.*
 ```
+
+**Do NOT delete `log.*` files before running the dump/reload loop.** The `.db` files need those logs to open. The dump/reload creates new self-contained files that don't reference any logs. After the loop completes, `rm -f __db.*` clears the stale shared memory regions and core3 will create fresh ones on startup.
+
+**Do NOT use `db5.3_load -r lsn`** — it corrupts large `DB_HASH` files (like `sceneobjects.db`).
 
 ---
 
