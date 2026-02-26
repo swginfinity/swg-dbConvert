@@ -10,61 +10,102 @@ On first boot after a code change, the server's CRC dirty-detection system sees 
 
 This tool solves the problem by converting all objects **offline** before the server starts. After conversion, the stored bytes match exactly what the current code would produce, so zero objects are dirty on first boot.
 
-## What It Does
+## Pipeline Overview
 
-The conversion runs in three phases:
+The conversion runs as a 4-phase pipeline. Each phase writes a manifest file and the next phase refuses to run without it, preventing out-of-order execution.
 
-### Pass 1: Hash Fix (byte-level, no C++ objects created)
+```
+Phase 1: clean       Strip BDB LSNs, remove __db.* and log.* files
+Phase 2: hashfix     Byte-level field hash replacement (~500K records/sec)
+Phase 3: reserialize C++ object round-trip (classic=all, smart=selective)
+Phase 4: finalize    BDB checkpoint, remove __db.*, prepare for core3
+```
+
+Two modes are available:
+
+- **Classic** — hashfix all records, then reserialize all records. Safe fallback, converts everything.
+- **Smart** — hashfix all records with metadata scan, probe per class, only reserialize classes where bytes actually differ. On a typical production database, this reduces reserialize work by 90%+.
+
+### Phase 1: Clean
+
+Prepares databases for a fresh BDB environment:
+
+1. Remove `__db.*` files (shared memory regions)
+2. Remove `log.*` files (transaction logs from previous environment)
+3. Create a private BDB environment and call `lsn_reset()` on each `.db` file
+4. Remove any leftover `__db.*` from the reset
+5. Clear stale phase manifests and `.converted` files from previous runs
+6. Write `.phase1_complete` manifest
+
+### Phase 2: Hash Fix
 
 SWGEmu's serialization format stores field names as 32-bit hashes:
 
 ```
 [uint16 varCount]
-[uint32 nameHash][uint32 dataSize][N bytes data]   ← field 1
-[uint32 nameHash][uint32 dataSize][N bytes data]   ← field 2
+[uint32 nameHash][uint32 dataSize][N bytes data]   <- field 1
+[uint32 nameHash][uint32 dataSize][N bytes data]   <- field 2
 ...
 ```
 
-When a class is renamed upstream (e.g., `QuadTreeEntry` → `TreeEntry`), the field name hashes change. Pass 1 scans every record's raw bytes and replaces old hashes with new ones. No C++ objects are created — it's a pure byte-level scan-and-replace that runs at ~500K records/second.
+When a class is renamed upstream (e.g., `QuadTreeEntry` -> `TreeEntry`), the field name hashes change. Phase 2 scans every record's raw bytes and replaces old hashes with new ones. No C++ objects are created — it's a pure byte-level scan-and-replace that runs at ~500K records/second.
 
-The hash replacements are defined in a table at the top of `dbconvert.cpp`:
+The hash replacements:
 
 ```cpp
-static const HashReplacement HASH_TABLE[] = {
-    { 0x2970c5d9, 0x763502f7, "coordinates" },  // QuadTreeEntry → TreeEntry
-    { 0x5a47d37d, 0xb1649cd1, "bounding"    },
-    { 0x5284d7c8, 0x256e90b3, "parent"      },
-    { 0xac3d85f4, 0xdbd7c28f, "radius"      },
-};
+{ 0x2970c5d9 -> 0x763502f7, "coordinates" }  // QuadTreeEntry -> TreeEntry
+{ 0x5a47d37d -> 0xb1649cd1, "bounding"    }
+{ 0x5284d7c8 -> 0x256e90b3, "parent"      }
+{ 0xac3d85f4 -> 0xdbd7c28f, "radius"      }
 ```
 
-### Pass 2: Reserialize (C++ round-trip)
+**Why hash fix must come first:** Without fixing hashes, `readObject()` can't find renamed fields by their old hash codes. The data silently reads as zeros. When `writeObject()` then saves the object, coordinates are permanently zeroed — all objects end up at 0,0,0.
 
-Each object is loaded through the full C++ deserialization chain (`ObjectManager::loadPersistentObject`), then immediately re-serialized with `writeObject()` and written back to BDB via direct `putData()`. This catches everything Pass 1 can't: new fields with default values, removed fields, reordered fields, changed data types, and any other structural changes.
+In **smart mode** (`--smart`), Phase 2 also extracts per-class metadata during the same scan pass:
+- `_className` for each record
+- Coordinate values (`posX`, `posZ`) via `MAX(ABS())` per class
+- First 20 and last 20 OIDs per class (quorum probe candidates for Phase 3)
+
+### Phase 3: Reserialize
+
+Each object is loaded through the full C++ deserialization chain (`ObjectManager::loadPersistentObject`), then re-serialized with `writeObject()` and written back to BDB. This catches everything Phase 2 can't: new fields with default values, removed fields, reordered fields, changed data types, and any other structural changes.
+
+**Classic mode:** Converts every record in every database.
+
+**Smart mode:** Uses metadata from Phase 2 to decide per class:
+
+1. **Quorum probe** — for each unique `_className`, load up to 40 records (first 20 + last 20 OIDs from Phase 2). For each: load, reserialize, compare bytes with current BDB data.
+2. If **any** of the 40 probe records differ, the entire class is marked `RESERIALIZE`.
+3. Print a class report showing which classes need work and which are clean.
+4. **Selective reserialize** — iterate all records, read `_className`, skip records whose class is `CLEAN`. Only reserialize records whose class needs it.
+
+Example smart mode output:
+```
+    TangibleObject                   479511  maxCoord=0.0      CLEAN
+    WeaponObject                     121735  maxCoord=0.0      CLEAN
+    FurnitureObject                   33033  maxCoord=5241.3   RESERIALIZE
+    PlayerObject                         15  maxCoord=0.0      RESERIALIZE
+    ──────────────────────────────────────────────
+    Total to reserialize: 33048 / 838886 (3.9%)
+```
 
 Key safety measures:
 
 - **`Core::MANAGED_REFERENCE_LOAD = false`** — Prevents `ManagedReference` from resolving cross-references. Without this, loading one object would trigger loading every object it references, blowing up memory.
-- **`initializeTransientMembers()` suppressed** — The autogen patch (see below) prevents runtime initialization code from corrupting persistent data during conversion. Without this, buildings lose their coordinates, factions get zeroed, access lists get cleared.
-- **500-object batches with DOB eviction** — Objects are evicted from the Distributed Object Broker after every 500 objects to keep memory bounded. This allows processing 63M+ records without running out of RAM.
-- **Direct `putData()`** — Writes go straight to BDB, bypassing the dirty-flag system that would queue objects for async save.
+- **`initializeTransientMembers()` suppressed** — The autogen patch prevents runtime initialization code from corrupting persistent data during conversion.
+- **500-object batches with DOB eviction** — Objects are evicted from the Distributed Object Broker after every 500 objects to keep memory bounded.
+- **Direct `putData()`** — Writes go straight to BDB, bypassing the dirty-flag system.
 
-### Phase 3: BDB Cleanup
+### Phase 4: Finalize
 
-After both passes complete, every `.db` file is dumped and reloaded via `db5.3_dump | db5.3_load`. This strips BDB environment dependencies (log sequence numbers, transaction IDs) so the databases work cleanly when opened by core3's fresh BDB environment.
+Proper BDB cleanup using engine3's checkpoint API:
 
-## Performance
+1. Initialize engine with `ObjectDatabaseManager` (opens BDB environment with transactions)
+2. Force a BDB checkpoint (`txn_checkpoint(DB_FORCE)`) — flushes all dirty pages to disk
+3. Remove `__db.*` files (shared memory regions, per-process, always recreated)
+4. Remove all phase manifest files (conversion is complete)
 
-On a production dataset with ~1M objects across 30 databases:
-
-| Phase | Time | Rate |
-|-------|------|------|
-| Pass 1 (hash fix) | ~30s | 500K records/sec |
-| Pass 2 (reserialize) | ~90s | 12K objects/sec |
-| BDB cleanup | ~10s | — |
-| **Total** | **~2 min** | — |
-
-Memory usage stays bounded regardless of database size thanks to the 500-object batch eviction pattern.
+**Important:** Phase 4 does **not** remove `log.*` files. The `.db` files contain LSNs that reference the log files. core3 opens with `DB_RECOVER` on startup, which reconciles the log state. Removing logs before core3 sees them causes the "LSN past end of log" error.
 
 ---
 
@@ -79,7 +120,8 @@ Memory usage stays bounded regardless of database size thanks to the 500-object 
 
 # 3. Stop core3 if running, then convert
 cd /path/to/MMOCoreORB/bin
-./dbconvert all
+./dbconvert all              # Classic mode (safe, converts everything)
+./dbconvert all --smart      # Smart mode (probes per class, skips unchanged)
 
 # 4. Start the server — zero dirty objects on first boot
 ./core3
@@ -91,211 +133,93 @@ The build script (`scripts/build.sh`) handles everything automatically:
 2. Applies 4 engine3 patches for standalone mode
 3. Patches ~325 autogenerated `readObject()` methods
 4. Adds the dbconvert CMake target
-5. Builds with `cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo .. && make dbconvert` (debug symbols for GDB)
+5. Builds with `cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo .. && make dbconvert`
 6. **Reverts all engine3 patches on exit** (even if the build fails)
 
-Engine3 is always left clean. The path you pass to `build.sh` is used for everything — source tree, autogen patches, and build output. `./dbconvert` itself needs no path arguments at runtime; it operates on the `databases/` directory next to it in `bin/`.
+Engine3 is always left clean.
 
 ---
 
 ## Embedded Build (infinity2.0.0 w101 branch)
 
-If you're using the `w101` branch of `swginfinity/infinity2.0.0`, `dbconvert.cpp` is already committed to the server repo and the CMake target is pre-configured. No external scripts or patches needed.
-
-### Prerequisites
-
-- Ubuntu 24.04 (or compatible)
-- clang 19 (`clang++-19` in PATH, or symlinked to `clang++`)
-- Standard SWGEmu dependencies: `libdb5.3-dev`, `liblua5.3-dev`, `libmysqlclient-dev`, `libdb5.3-util`, etc.
-
-### Step-by-Step
+If you're using the `w101` branch of `swginfinity/infinity2.0.0`, `dbconvert.cpp` is already committed to the server repo and the CMake target is pre-configured.
 
 ```bash
-# 1. Clone or pull w101
-cd /home/swgemu/workspace
-git clone git@github.com:swginfinity/infinity2.0.0.git
-cd infinity2.0.0
-git checkout w101
-git pull origin w101
-
-# 2. Initialize engine3 submodule
-cd MMOCoreORB
-git submodule update --init --recursive
-
-# 3. Create build directory and run cmake
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-      -DCMAKE_C_COMPILER=clang \
-      -DCMAKE_CXX_COMPILER=clang++ \
-      -DENABLE_ERROR_ON_WARNINGS=OFF \
-      ..
-
-# 4. Build the server (core3)
-make -j24
-# Binary: ../bin/core3
-
-# 5. Build dbconvert (separate target — NOT included in make -j24)
+# 1. Build dbconvert (separate target — NOT included in make all)
+cd MMOCoreORB/build
+cmake ..
 make dbconvert -j24
-# Binary: ../bin/dbconvert
 
-# 6. Set up databases
+# 2. Run conversion
 cd ../bin
-cp -r /path/to/2.0.0/databases databases
-# Keep a clean backup:
-cp -r databases databases_clean
-
-# 7. Configure BDB for large datasets
-cat >> conf/config-local.lua << 'LUAEOF'
-Core3.BerkeleyDB = {
-    envMaxLocks = 10000000,
-    envMaxLockers = 10000000,
-    envMaxLockObjects = 10000000,
-}
-LUAEOF
-
-# 8. Run conversion
-./dbconvert all
-
-# 9. Start the server
-./core3
+./dbconvert all --smart
 ```
 
-### Build Order Notes
-
-- `make -j24` builds **only core3**. dbconvert is `EXCLUDE_FROM_ALL` — it must be built explicitly.
-- `make dbconvert -j24` compiles the converter using the same engine3 and IDL objects as core3.
-- The `if(EXISTS)` cmake guard means the build won't break if `dbconvert.cpp` is missing — it simply won't create the target.
-- If clang 19 is installed as `clang-19`/`clang++-19`, use those paths explicitly in the cmake command.
-
-### If Conversion Fails
-
-```bash
-# Restore from clean backup
-rm -rf databases/
-cp -r databases_clean databases
-
-# Fix the issue, rebuild, retry
-cd ../build && make dbconvert -j24
-cd ../bin && ./dbconvert all
-```
+The `EXCLUDE_FROM_ALL` flag means `make all` won't build dbconvert — you must explicitly `make dbconvert`.
 
 ---
 
 ## Commands
 
-```bash
-./dbconvert all              # Convert all databases (skip already-converted)
-./dbconvert <database>       # Convert a single database (e.g., sceneobjects)
-./dbconvert sample <db>      # Test mode: convert 1 record per class type
-./dbconvert hashonly [db]    # Pass 1 only (skip C++ round-trip)
-./dbconvert clean            # Reset BDB LSNs for cross-environment migration
-```
-
-### Convert All
+### Full Pipeline
 
 ```bash
-./dbconvert all
+./dbconvert all                 # Phases 1-2-3-4, classic mode
+./dbconvert all --smart         # Phases 1-2-3-4, smart mode
 ```
 
-Discovers all `.db` files in `databases/`, sorts by size (smallest first), skips any with a `.converted` manifest, and processes the rest. Output:
+Runs all four phases in order. If interrupted, re-run the same command — Phase 3 skips already-converted databases via `.converted` manifest files.
 
-```
-================================================================
-  Infinity Database Converter (standalone)
-  Pass 1: Hash fix (QuadTreeEntry -> TreeEntry)
-  Pass 2: Reserialize (C++ round-trip with current code)
-================================================================
+### Individual Phases
 
-30 databases to convert
-
-================================================================
-  [1/30] accounts
-================================================================
-  Pass 1: Hash fix...
-    3 records, 0 fixed in 0s
-  Pass 2: Reserialize...
-    3/3 :: 0 errors :: 0s
-
-...
-
-================================================================
-  [30/30] sceneobjects
-================================================================
-  Pass 1: Hash fix...
-    836766 records, 836561 fixed in 21s
-  Pass 2: Reserialize...
-    836766/836766 :: 12800/s :: 40 errors :: ETA 0s
-
-================================================================
-  COMPLETE
-  Hash fixes:    929189
-  Reserialized:  1089939
-  Errors:        42
-  Elapsed:       0h 2m 9s
-  Error log:     databases/dbconvert_errors.log
-================================================================
-
-=== Rebuilding databases for clean startup ===
-  accounts.db OK
-  sceneobjects.db OK
-  ...
-Rebuilt 27 databases
-Removed BDB log and environment files.
-Databases are ready for core3.
-
-Done. Run './core3' to start the server.
-```
-
-### Sample Mode
+Each phase can be run independently. Phase gates enforce ordering: each phase requires the previous phase's manifest to exist.
 
 ```bash
-./dbconvert sample sceneobjects
+./dbconvert clean               # Phase 1: Strip LSNs, clean environment
+./dbconvert hashfix             # Phase 2: Byte-level hash replacement
+./dbconvert hashfix --smart     # Phase 2: Hash replacement + metadata scan
+./dbconvert reserialize         # Phase 3: Classic (all records)
+./dbconvert reserialize --smart # Phase 3: Smart (probe + selective)
+./dbconvert finalize            # Phase 4: Checkpoint + cleanup
 ```
 
-Scans the database for unique `_className` values, picks one record of each type, and converts only those. This is invaluable for testing — if a class type has a serialization problem, you'll find out in seconds instead of waiting for a full conversion.
-
-Output includes the list of class types converted:
-
-```
-  Class types converted:
-    CreatureObject
-    BuildingObject
-    PlayerObject
-    CellObject
-    ...
-```
-
-### Hash-Only Mode
-
-```bash
-./dbconvert hashonly           # All databases, Pass 1 only
-./dbconvert hashonly accounts  # Single database, Pass 1 only
-```
-
-Only performs the byte-level hash replacement (Pass 1). Useful when you only need to fix field renames without doing a full reserialize. Note that without Pass 2, objects will still be CRC-dirty if there are any other serialization changes.
-
-### Clean Mode
-
-```bash
-./dbconvert clean
-```
-
-Resets BDB log sequence numbers (LSNs) and removes environment files (`__db.*`, `log.*`). This is required when moving `.db` files between machines or BDB environments — without it, core3 gets `FATAL - unable to open database` with "LSN past end of log" errors.
+Running phases individually is useful for:
+- **Debugging:** Run just Phase 2 to verify hash fix counts match expectations
+- **Incremental work:** Run Phase 1-2, inspect, then decide classic vs smart for Phase 3
+- **Recovery:** If Phase 3 fails, fix the issue and re-run Phase 3 alone (Phase 2 is still done)
 
 ### Resume After Interruption
 
 If conversion is interrupted (crash, Ctrl+C, power loss), re-run the same command:
 
 ```bash
-./dbconvert all
+./dbconvert all --smart
 ```
 
-Already-converted databases are tracked via `.converted` manifest files and automatically skipped. To force re-conversion of a specific database:
+Already-converted databases are tracked via `.converted` manifest files and automatically skipped. To force re-conversion of a specific database, delete its manifest and re-run Phase 3:
 
 ```bash
 rm databases/sceneobjects.converted
-./dbconvert sceneobjects
+./dbconvert reserialize --smart
 ```
+
+---
+
+## Performance
+
+On a production dataset with ~1M objects across 30 databases:
+
+| Phase | Time | Rate |
+|-------|------|------|
+| Phase 1 (clean) | ~2s | — |
+| Phase 2 (hashfix) | ~30s | 500K records/sec |
+| Phase 3 classic (reserialize all) | ~90s | 12K objects/sec |
+| Phase 3 smart (selective) | ~10s | skips 90%+ of records |
+| Phase 4 (finalize) | ~3s | — |
+| **Total (classic)** | **~2 min** | — |
+| **Total (smart)** | **~45s** | — |
+
+Memory usage stays bounded regardless of database size thanks to the 500-object batch eviction pattern.
 
 ---
 
@@ -307,16 +231,14 @@ Errors are logged to both stdout and `databases/dbconvert_errors.log`:
 [sceneobjects] OID=0x0001000009a75efe class=Component error=loadPersistentObject returned null (unregistered class?)
 ```
 
-Each error includes the database name, object ID (hex), class name, and error message.
-
 | Error | Meaning | Action |
 |-------|---------|--------|
-| `loadPersistentObject returned null` | Object's template CRC not registered in ObjectManager | Usually custom items from removed content. Safe to ignore. |
-| `Could not load database` | `.db` file exists but isn't in the databases manifest | Orphan file. Safe to ignore. |
-| `StreamIndexOutOfBoundsException` | Corrupt serialized data — read past end of stream | Investigate the specific object. May indicate a class definition mismatch. |
-| `unknown exception (possible corrupt data)` | Unhandled exception during deserialization | Corrupt record. Object will be left as-is in BDB. |
+| `loadPersistentObject returned null` | Object's template CRC not registered | Usually removed custom content. Safe to ignore. |
+| `Could not load database` | `.db` file exists but isn't in the manifest | Orphan file. Safe to ignore. |
+| `StreamIndexOutOfBoundsException` | Read past end of stream | Corrupt record. Investigate the specific object. |
+| `unknown exception (possible corrupt data)` | Unhandled exception during deserialization | Corrupt record. Object left as-is. |
 
-Errors do **not** stop conversion — the tool logs them and continues with the next object. A small number of errors (< 50 out of 1M+) is normal for production databases with legacy custom content.
+Errors do **not** stop conversion — the tool logs them and continues. A small number of errors (< 50 out of 1M+) is normal for production databases with legacy custom content.
 
 ---
 
@@ -324,21 +246,21 @@ Errors do **not** stop conversion — the tool logs them and continues with the 
 
 ```
 swgemu-dbconvert/
-├── README.md                           # This file
-├── LICENSE                             # MIT License
+├── README.md
+├── LICENSE
 ├── .gitignore
 │
 ├── src/tools/
-│   └── dbconvert.cpp                  # The standalone converter (725 lines)
+│   └── dbconvert.cpp                  # The converter (4-phase pipeline)
 │
-├── patches/                            # Engine3 patches (temporary, applied during build only)
+├── patches/                            # Engine3 patches (temporary, applied during build)
 │   ├── 001-taskmanager-standalone-mode.patch
 │   ├── 002-uncompress-error-handling.patch
 │   ├── 003-objectdatabase-decompress-guard.patch
 │   └── 004-orb-null-check.patch
 │
 ├── scripts/
-│   ├── build.sh                        # Automated build (patches → compile → revert)
+│   ├── build.sh                        # Automated build (patches -> compile -> revert)
 │   ├── patch_autogen.py                # Patches autogenerated readObject() methods
 │   ├── backup.sh                       # Snapshot databases before conversion
 │   └── restore.sh                      # Restore databases from a snapshot
@@ -350,7 +272,7 @@ swgemu-dbconvert/
 │   └── INSTALL.md                      # Step-by-step manual install guide
 │
 └── examples/
-    └── main.cpp.example                # Optional: redirect ./core3 convert → ./dbconvert
+    └── main.cpp.example                # Optional: redirect ./core3 convert -> ./dbconvert
 ```
 
 ---
@@ -359,14 +281,12 @@ swgemu-dbconvert/
 
 The `patches/` directory contains 4 minimal patches for engine3. These are **only needed during compilation** — `build.sh` applies them before building and reverts them immediately after, leaving engine3 clean.
 
-The patches exist because dbconvert runs as a standalone tool without the full server infrastructure (no zone managers, no player sessions, no task scheduler). Without them, engine3 crashes on null pointers and division-by-zero in code paths that assume a running server.
-
-| # | Patch | Files Modified | Purpose |
-|---|-------|---------------|---------|
-| 1 | `001-taskmanager-standalone-mode` | `TaskManagerImpl.cpp` | Returns early when `workerCount < 0` (no task threads). Runs tasks inline when no worker queues exist (prevents divide-by-zero in `% DEFAULT_WORKER_QUEUES`). |
-| 2 | `002-uncompress-error-handling` | `LocalDatabase.cpp`, `LocalDatabase.h` | Changes `uncompress()` from `void` to `bool`. Returns `false` on zlib `Z_DATA_ERROR` instead of silently returning corrupt data. |
-| 3 | `003-objectdatabase-decompress-guard` | `ObjectDatabase.cpp` | `getData()`, `getDataNoTx()`, and `getNextKeyAndValue()` check `uncompress()` return value. Skip corrupt records instead of crashing. |
-| 4 | `004-orb-null-check` | `DistributedObjectBroker.cpp` | Null check for `objectManager` in `lookUp()`. Prevents crash when the full ORB infrastructure isn't initialized. |
+| # | Patch | Purpose |
+|---|-------|---------|
+| 1 | `001-taskmanager-standalone-mode` | Returns early when `workerCount < 0` (no task threads). Prevents divide-by-zero. |
+| 2 | `002-uncompress-error-handling` | Changes `uncompress()` from `void` to `bool`. Returns `false` on corrupt data. |
+| 3 | `003-objectdatabase-decompress-guard` | getData/getNextKeyAndValue check uncompress() return. Skip corrupt records. |
+| 4 | `004-orb-null-check` | Null check for `objectManager` in `lookUp()`. Prevents crash without full ORB. |
 
 These patches do **not** change core3 behavior. They only add guards for edge cases that occur in standalone tool mode.
 
@@ -374,60 +294,28 @@ These patches do **not** change core3 behavior. They only add guards for edge ca
 
 ## The `initializeTransientMembers()` Patch
 
-This is the most critical piece of the build. Every autogenerated `readObject()` method (generated from IDL files) ends with:
+Every autogenerated `readObject()` method (from IDL files) ends with a call to `initializeTransientMembers()`. During normal server operation, this sets up runtime state. During **conversion**, it's catastrophic:
 
-```cpp
-stream->setOffset(_currentOffset + _varSize);
-}
-
-initializeTransientMembers();
-```
-
-During normal server operation, `initializeTransientMembers()` sets up runtime state — loading templates, creating components, initializing managers. During **conversion**, this is catastrophic because none of those systems exist:
-
-| Class | What `initializeTransientMembers()` does | Consequence during conversion |
-|-------|------------------------------------------|------------------------------|
-| `SceneObjectImpl` | Loads template from TemplateManager, creates ContainerComponent | Segfault (no TemplateManager) |
+| Class | What it does | Consequence during conversion |
+|-------|-------------|------------------------------|
+| `SceneObjectImpl` | Loads template, creates ContainerComponent | Segfault (no TemplateManager) |
 | `TangibleObjectImpl` | Resets `faction = 0` for non-standard factions | Factions lost |
-| `BuildingObjectImpl` | Clears `registeredPlayerIdList`, calls `updatePaidAccessList()` | Building access lists wiped |
-| `ManagedObjectImpl` | Resets `lastCRCSave = 0` | All objects marked dirty anyway |
-| `CreatureObjectImpl` | Accesses ZoneServer, loads skills | Segfault or corrupt skill data |
+| `BuildingObjectImpl` | Clears access lists, calls `updatePaidAccessList()` | Building access wiped |
+| `CreatureObjectImpl` | Accesses ZoneServer, loads skills | Segfault or corrupt data |
 
-The `scripts/patch_autogen.py` script patches all ~325 autogenerated files to guard the call:
+The `scripts/patch_autogen.py` script patches all ~325 autogenerated files:
 
 ```cpp
 if (Core::MANAGED_REFERENCE_LOAD) initializeTransientMembers();
 ```
 
-`Core::MANAGED_REFERENCE_LOAD` is `true` during normal server operation and `false` during conversion (set by `dbconvert` before loading any objects).
+`MANAGED_REFERENCE_LOAD` is `true` during normal server operation and `false` during conversion.
 
-**Important:** This patch must be re-applied after every IDL rebuild (`make rebuild-idl`) since IDL regeneration overwrites the autogen files.
+**Re-run this script after every `make rebuild-idl`** since IDL regeneration overwrites the patched files.
 
 ---
 
-## Architecture Deep Dive
-
-### SWGEmu Object Persistence
-
-```
-┌─────────────┐     writeObject()      ┌──────────────┐
-│  C++ Object  │ ────────────────────→  │  BDB Record   │
-│  (in memory) │                        │  (on disk)    │
-│              │ ←────────────────────  │               │
-└─────────────┘     readObject()       └──────────────┘
-                                              │
-                                    CRC32 of raw bytes
-                                    stored as lastCRCSave
-                                              │
-                              ┌────────────────┴────────────────┐
-                              │    On each auto-save cycle:      │
-                              │    writeObject() → CRC32          │
-                              │    Compare with lastCRCSave       │
-                              │    If different → write to BDB    │
-                              └─────────────────────────────────┘
-```
-
-The CRC dirty-detection system (`ObjectManager::deSerializeObject` / `DOBObjectManager::commitUpdatePersistentObjectToDB`) ensures only modified objects are written to disk. After `dbconvert`, stored bytes match `writeObject()` output exactly, so `lastCRCSave` matches and zero objects are dirty.
+## Architecture
 
 ### Serialization Format
 
@@ -435,49 +323,61 @@ Every SWGEmu object serializes to a flat, hash-indexed binary format:
 
 ```
 Offset  Content
-──────  ───────────────────────────────────
-0x0000  uint16 varCount (number of fields)
+------  -----------------------
+0x0000  uint16 varCount
 0x0002  uint32 nameHash_0 (STRING_HASHCODE of "ClassName.fieldName")
 0x0006  uint32 dataSize_0
 0x000A  byte[dataSize_0] data_0
-...     uint32 nameHash_N
-        uint32 dataSize_N
-        byte[dataSize_N] data_N
+...     repeats for each field
 ```
 
-The `STRING_HASHCODE` is computed from the **fully qualified** field name including the class: e.g., `TreeEntry.coordinates` hashes to `0x763502f7`. When a class is renamed, all its field hashes change even though the field names themselves didn't.
+**Critical:** engine3 `readInt()` uses native byte order (little-endian on x86_64), **not** big-endian network order. Hash replacements use `memcpy()` to match.
 
-**Critical: engine3 `readInt()` uses native byte order** (little-endian on x86_64 via `memcpy`), **not** big-endian network order. The hash fix pass writes replacements with `memcpy(&newHash)` to match. Using manual big-endian byte assignment would cause all object positions to read as 0,0,0.
-
-### Memory Management
+### Phase Gate Manifests
 
 ```
-┌─────────────────────────────────────────────┐
-│  for each batch of 500 objects:             │
-│    1. loadPersistentObject(oid)             │
-│       → object created in DOB memory        │
-│    2. writeObject() → new serialized bytes  │
-│    3. putData(oid, bytes) → write to BDB    │
-│    4. After 500: commitLocalTransaction()   │
-│    5. removeObject(oid) from DOB for each   │
-│       → frees C++ object memory             │
-│    6. Continue with next batch              │
-└─────────────────────────────────────────────┘
+.phase1_complete   <- written by clean
+.phase2_complete   <- written by hashfix, requires .phase1_complete
+.phase3_complete   <- written by reserialize, requires .phase2_complete
+<dbname>.converted <- per-database resume tracking during Phase 3
+(finalize)         <- requires .phase3_complete, removes all manifests
 ```
 
-This ensures memory usage stays constant regardless of database size. The `commitLocalTransaction()` flushes BDB writes, and the `removeObject()` + adapter deletion evicts the C++ objects from the Distributed Object Broker.
+### Memory Management (Phase 3)
 
----
+```
+for each batch of 500 objects:
+  1. loadPersistentObject(oid) -> object in DOB memory
+  2. writeObject() -> new serialized bytes
+  3. putData(oid, bytes) -> write to BDB
+  4. After 500: commitLocalTransaction()
+  5. removeObject(oid) from DOB for each -> frees C++ memory
+  6. Continue with next batch
+```
 
-## Manual Build (Without `build.sh`)
+Memory usage stays constant regardless of database size.
 
-If you prefer to apply changes yourself, see [docs/INSTALL.md](docs/INSTALL.md) for step-by-step instructions covering:
+### Smart Mode Data Flow
 
-1. Copying `dbconvert.cpp` into your source tree
-2. Applying the 4 engine3 patches
-3. Adding the CMake target to `CMakeLists.txt`
-4. Patching autogenerated `readObject()` methods
-5. Building with `make dbconvert`
+```
+Phase 2 (hashfix --smart)
+  |
+  | For each record: extract _className, coordinates, OID
+  | Build ClassInfo per class:
+  |   - count, maxAbsX, maxAbsZ
+  |   - first 20 OIDs, last 20 OIDs (ring buffer)
+  v
+Phase 3 (reserialize --smart)
+  |
+  | For each class: load probe OIDs (first 20 + last 20)
+  |   Load -> reserialize -> compare bytes with BDB
+  |   If ANY differ -> class marked RESERIALIZE
+  |   If ALL match -> class marked CLEAN
+  |
+  | Full iteration: skip CLEAN records, only reserialize RESERIALIZE records
+  v
+Result: typically 3-10% of records actually need C++ round-trip
+```
 
 ---
 
@@ -485,72 +385,63 @@ If you prefer to apply changes yourself, see [docs/INSTALL.md](docs/INSTALL.md) 
 
 ### Different Field Renames
 
-The hash table in `dbconvert.cpp` is specific to the `QuadTreeEntry` → `TreeEntry` rename. For other migrations:
+The hash table is specific to `QuadTreeEntry` -> `TreeEntry`. For other migrations:
 
-1. Identify which IDL class or field names changed between your versions
-2. Compute the old and new hashes:
+1. Compute the old and new hashes:
    ```cpp
-   // In any SWGEmu source file:
    printf("old: 0x%08x\n", STRING_HASHCODE("OldClass.fieldName"));
    printf("new: 0x%08x\n", STRING_HASHCODE("NewClass.fieldName"));
    ```
-3. Add entries to the `HASH_TABLE[]` array in `dbconvert.cpp`
+2. Add entries to the `HASH_TABLE[]` array in `dbconvert.cpp`
 
-If no field names changed (only new fields added or removed), Pass 2 handles it automatically. You can skip Pass 1 with `hashonly` mode or simply leave the hash table as-is — it won't match anything and Pass 1 will be a fast no-op.
+If no field names changed (only new/removed fields), Phase 3 handles it automatically. Phase 2 becomes a fast no-op (no hashes match).
 
 ### Custom Object Types
 
-Custom C++ object types are converted automatically as long as:
-
+Custom C++ types are converted automatically as long as:
 1. The class is registered in `ObjectManager` (has a `serverObjectCRC`)
 2. `readObject()` and `writeObject()` work correctly
 3. The autogenerated files were patched (if the class has IDL-generated code)
 
-Objects with unregistered CRCs are logged as errors but don't stop conversion.
-
 ### Index Databases
 
-Databases with "index" in the name (e.g., `playerstructuresindex.db`) are **skipped** during conversion because core3 rebuilds them automatically at boot ("creating player structures index association").
+Databases with "index" in the name are **skipped** — core3 rebuilds them at boot.
 
 ---
 
 ## Helper Scripts
 
-### `scripts/backup.sh` — Snapshot Databases
+### `scripts/backup.sh`
 
 ```bash
 ./scripts/backup.sh <snapshot_name> [source_dir]
-
-# Examples:
 ./scripts/backup.sh pre_convert /path/to/bin/databases
-./scripts/backup.sh pre_convert  # uses ./databases as default
 ```
 
-Creates a named copy of all `.db` files. Lists existing snapshots when run without arguments.
+Creates a named copy of all `.db` files.
 
-### `scripts/restore.sh` — Restore from Snapshot
+### `scripts/restore.sh`
 
 ```bash
 ./scripts/restore.sh <snapshot_name> [target_dir]
-
-# Examples:
 ./scripts/restore.sh pre_convert /path/to/bin/databases
-./scripts/restore.sh pre_convert  # uses ./databases as default
 ```
 
-Wipes the target directory (`.db`, `log.*`, `__db.*`, `.converted`, `.progress` files) and copies the snapshot. Checks that core3 and dbconvert aren't running before proceeding.
+Wipes the target (`.db`, `log.*`, `__db.*`, `.converted`, `.progress` files) and copies the snapshot. Checks that core3 and dbconvert aren't running first.
 
-### `scripts/patch_autogen.py` — Patch readObject() Methods
+### `scripts/patch_autogen.py`
 
 ```bash
 python3 scripts/patch_autogen.py /path/to/MMOCoreORB/src
-
-# Patches files in /path/to/MMOCoreORB/src/autogen/
 ```
 
-Takes the server `src/` directory as a required argument and patches all autogenerated `readObject()` methods in `src/autogen/` to guard `initializeTransientMembers()` with `Core::MANAGED_REFERENCE_LOAD`. Must be re-run after every `make rebuild-idl`.
+Patches all autogenerated `readObject()` methods. Must be re-run after every `make rebuild-idl`.
 
-**Note:** `build.sh` calls this automatically with the correct path. You only need to run it manually if you're doing a manual build or after regenerating IDL files.
+---
+
+## Manual Build
+
+See [docs/INSTALL.md](docs/INSTALL.md) for step-by-step instructions.
 
 ---
 
@@ -560,65 +451,47 @@ Takes the server `src/` directory as a required argument and patches all autogen
 
 Run `dbconvert` from the `bin/` directory where `databases/` is located.
 
+### Phase gate error ("Phase X has not been completed")
+
+Run the required phase first, or use `./dbconvert all` to run the full pipeline.
+
 ### Patch script reports "Skipped: 325, Patched: 0"
 
 The pattern wasn't found. Verify:
 1. Autogen files are built (`make rebuild-idl` or `make idlobjects`)
-2. Open any autogen `.cpp` file, find `readObject()`, check the ending pattern matches what `patch_autogen.py` expects
+2. Open any autogen `.cpp` file, find `readObject()`, check the ending pattern
 
 ### Build fails with undefined references
 
-Run `cmake ..` after adding the dbconvert target. The `EXCLUDE_FROM_ALL` flag means it won't appear in `make all` — you must explicitly build with `make dbconvert`.
+Run `cmake ..` after adding the dbconvert target.
 
 ### Conversion crashes with segfault
 
-- Verify the autogen patch was applied **to the correct source tree**. `patch_autogen.py` takes the `src/` directory as an argument — make sure it matches the MMOCoreORB you're building from. Without this patch, `initializeTransientMembers()` tries to access managers that don't exist in standalone mode.
-- Check that `Core::MANAGED_REFERENCE_LOAD` is being set to `false` (this is in the dbconvert source and should work out of the box).
-- The binary is built with `RelWithDebInfo` by default, so you can get line numbers in GDB: `gdb ./dbconvert` → `run all` → `bt` on crash.
+- Verify the autogen patch was applied to the correct source tree
+- Check `Core::MANAGED_REFERENCE_LOAD` is being set to `false`
+- Use GDB: `gdb ./dbconvert` -> `run all` -> `bt` on crash
 
 ### Server boots but objects have wrong data
 
-The autogen patch may not have applied correctly:
+The autogen patch may not have applied:
 
 ```bash
 grep -r "MANAGED_REFERENCE_LOAD.*initializeTransientMembers" src/autogen/ | wc -l
 ```
 
-Should match ~325. If it's 0, re-run `patch_autogen.py`.
+Should match ~325.
 
-### "LSN past end of log" / "Commonly caused by moving a database" when starting core3
+### "LSN past end of log" on core3 startup
 
-```
-BDB2506 file guilds.db has LSN 1/2012908, past end of log at 1/2325
-BDB2507 Commonly caused by moving a database from one database environment
-BDB2508 to another without clearing the database LSNs, or by removing all of
-BDB2509 the log files from a database environment
-FATAL - unable to open database with ret code Invalid argument
-```
-
-This happens after conversion because the `.db` files contain LSNs (log sequence numbers) from the dbconvert BDB environment, which don't match core3's fresh environment. The fix is to rebuild each database with `db5.3_dump | db5.3_load`, which exports the data as plain text and creates a brand new `.db` file with no environment association:
-
-```bash
-cd /path/to/MMOCoreORB/bin/databases
-for f in *.db; do db5.3_dump "$f" | db5.3_load "$f.tmp" && mv "$f.tmp" "$f"; done
-rm -f __db.*
-```
-
-**Do NOT delete `log.*` files before running the dump/reload loop.** The `.db` files need those logs to open. The dump/reload creates new self-contained files that don't reference any logs. After the loop completes, `rm -f __db.*` clears the stale shared memory regions and core3 will create fresh ones on startup.
-
-**Do NOT use `db5.3_load -r lsn`** — it corrupts large `DB_HASH` files (like `sceneobjects.db`).
+Phase 4 was not run, or was run incorrectly. Re-run `./dbconvert finalize` (requires Phase 3 complete) or run the full pipeline again from Phase 1.
 
 ---
 
 ## Prerequisites
 
-- A working SWGEmu Core3 build environment (GCC, CMake, BerkeleyDB 5.3, Boost, etc.)
+- A working SWGEmu Core3 build environment (GCC/Clang, CMake, BerkeleyDB 5.3, Boost)
 - Server must build and run successfully before adding dbconvert
 - Python 3 (for `patch_autogen.py`)
-- `db5.3_dump` and `db5.3_load` utilities:
-  ```bash
-  sudo apt-get install libdb5.3-util
-  ```
 
 ---
 
