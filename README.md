@@ -291,7 +291,8 @@ swgemu-dbconvert/
 │   └── CMakeLists.txt.patch            # CMake additions reference
 │
 ├── docs/
-│   └── INSTALL.md                      # Step-by-step manual install guide
+│   ├── INSTALL.md                      # Step-by-step manual install guide
+│   └── CORE3_CHANGES.md               # Required Core3 source modifications
 │
 └── examples/
     └── main.cpp.example                # Optional: add ./core3 convert subcommand
@@ -311,6 +312,21 @@ The `patches/` directory contains 4 minimal patches for engine3. These are **onl
 | 4 | `004-orb-null-check` | Null check for `objectManager` in `lookUp()`. Prevents crash without full ORB. |
 
 These patches do **not** change core3 behavior. They only add guards for edge cases that occur in standalone tool mode.
+
+---
+
+## Core3 Source Changes
+
+In addition to the engine3 patches and autogen patch, dbconvert requires modifications to **16 Core3 source files**. These are permanent changes to your server code (not temporary build patches) that add:
+
+- **Crash guards** — Early returns in `initializeTransientMembers()` / `notifyLoadFromDatabase()` to prevent segfaults when server infrastructure doesn't exist
+- **Data preservation** — Cached values in `TemplateReference`, `ZoneReference`, `CreatureTemplateReference`, `SkillList`, and `AbilityList` that survive the load→save round-trip when manager lookups return null
+
+Without these changes, dbconvert will either crash or **silently destroy data** (template CRCs zeroed, zone names erased, all player skills and abilities permanently lost).
+
+**See [docs/CORE3_CHANGES.md](docs/CORE3_CHANGES.md) for the complete list with exact code for each change.**
+
+The changes are safe for normal server operation — they only activate when `Core::MANAGED_REFERENCE_LOAD` is `false`, which only happens during conversion.
 
 ---
 
