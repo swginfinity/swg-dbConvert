@@ -30,8 +30,8 @@ Two modes are available:
 
 Prepares databases for a fresh BDB environment:
 
-1. Remove `__db.*` files (shared memory regions)
-2. Remove `log.*` files (transaction logs from previous environment)
+1. If `log.*` files exist, open the BDB environment with `DB_RECOVER` and force a checkpoint — this replays any uncommitted transaction log data into the `.db` file pages before the logs are removed. Without this step, data written by tools that didn't checkpoint (e.g., small databases like guilds, chatrooms) would be permanently lost when the logs are deleted.
+2. Remove `__db.*` files (shared memory regions) and `log.*` files (transaction logs)
 3. Create a private BDB environment and call `lsn_reset()` on each `.db` file
 4. Remove any leftover `__db.*` from the reset
 5. Clear stale phase manifests and `.converted` files from previous runs
@@ -137,25 +137,6 @@ The build script (`scripts/build.sh`) handles everything automatically:
 6. **Reverts all engine3 patches on exit** (even if the build fails)
 
 Engine3 is always left clean.
-
----
-
-## Embedded Build (infinity2.0.0 w101 branch)
-
-If you're using the `w101` branch of `swginfinity/infinity2.0.0`, `dbconvert.cpp` is already committed to the server repo and the CMake target is pre-configured.
-
-```bash
-# 1. Build dbconvert (separate target — NOT included in make all)
-cd MMOCoreORB/build
-cmake ..
-make dbconvert -j24
-
-# 2. Run conversion
-cd ../bin
-./dbconvert all --smart
-```
-
-The `EXCLUDE_FROM_ALL` flag means `make all` won't build dbconvert — you must explicitly `make dbconvert`.
 
 ---
 
@@ -269,10 +250,11 @@ swgemu-dbconvert/
 │   └── CMakeLists.txt.patch            # CMake additions reference
 │
 ├── docs/
-│   └── INSTALL.md                      # Step-by-step manual install guide
+│   ├── INSTALL.md                      # Step-by-step manual install guide
+│   └── CORE3_CHANGES.md               # Required Core3 source modifications
 │
 └── examples/
-    └── main.cpp.example                # Optional: redirect ./core3 convert -> ./dbconvert
+    └── main.cpp.example                # Optional: add ./core3 convert subcommand
 ```
 
 ---
@@ -289,6 +271,21 @@ The `patches/` directory contains 4 minimal patches for engine3. These are **onl
 | 4 | `004-orb-null-check` | Null check for `objectManager` in `lookUp()`. Prevents crash without full ORB. |
 
 These patches do **not** change core3 behavior. They only add guards for edge cases that occur in standalone tool mode.
+
+---
+
+## Core3 Source Changes
+
+In addition to the engine3 patches and autogen patch, dbconvert requires modifications to **16 Core3 source files**. These are permanent changes to your server code (not temporary build patches) that add:
+
+- **Crash guards** — Early returns in `initializeTransientMembers()` / `notifyLoadFromDatabase()` to prevent segfaults when server infrastructure doesn't exist
+- **Data preservation** — Cached values in `TemplateReference`, `ZoneReference`, `CreatureTemplateReference`, `SkillList`, and `AbilityList` that survive the load→save round-trip when manager lookups return null
+
+Without these changes, dbconvert will either crash or **silently destroy data** (template CRCs zeroed, zone names erased, all player skills and abilities permanently lost).
+
+**See [docs/CORE3_CHANGES.md](docs/CORE3_CHANGES.md) for the complete list with exact code for each change.**
+
+The changes are safe for normal server operation — they only activate when `Core::MANAGED_REFERENCE_LOAD` is `false`, which only happens during conversion.
 
 ---
 
@@ -407,6 +404,23 @@ Custom C++ types are converted automatically as long as:
 
 Databases with "index" in the name are **skipped** — core3 rebuilds them at boot.
 
+### Databases to Delete Before Conversion
+
+These databases are rebuilt from scratch by core3 on every boot. Deleting them before conversion saves time and avoids unnecessary errors:
+
+```bash
+cd MMOCoreORB/bin/databases
+rm -f navareas.db spawnareas.db clientobjects.db
+```
+
+| Database | Purpose | Why delete |
+|----------|---------|------------|
+| `navareas.db` | Navigation mesh areas | Rebuilt from navmesh data at boot |
+| `spawnareas.db` | Spawn region definitions | Rebuilt from Lua spawn scripts at boot |
+| `clientobjects.db` | Client-side object cache | Rebuilt from templates at boot |
+
+These contain no player data and are never worth converting.
+
 ---
 
 ## Helper Scripts
@@ -481,6 +495,36 @@ grep -r "MANAGED_REFERENCE_LOAD.*initializeTransientMembers" src/autogen/ | wc -
 
 Should match ~325.
 
+### guilds.db (or other small databases) empty after conversion
+
+dbconvert converts databases **in place** in the `databases/` directory. It does not copy databases from a separate source directory.
+
+If you migrated databases from an older server version by copying files, the small databases (guilds, chatrooms, surveys, etc.) may appear empty if the original copy was made without a proper BDB checkpoint. This happens because BDB's write-ahead logging stores data in transaction log files (`log.*`) first, and only flushes to `.db` file pages during checkpoints. If the log files were removed before a checkpoint, the data is lost.
+
+**To recover guilds from a backup that has intact data:**
+
+```bash
+cd MMOCoreORB/bin
+
+# Dump from source (backup must have data — verify with db5.3_stat -d first)
+db5.3_stat -d /path/to/backup/guilds.db | grep "Number of keys"
+db5.3_dump /path/to/backup/guilds.db > /tmp/guilds_dump.txt
+
+# Load into target
+db5.3_load -f /tmp/guilds_dump.txt databases/guilds.db
+
+# Reset LSNs so it works in the current BDB environment
+db5.3_load -r lsn databases/guilds.db
+
+# Verify
+db5.3_stat -d databases/guilds.db | grep "Number of keys"
+db5.3_verify databases/guilds.db
+```
+
+This works safely for small databases. Do **not** use `db5.3_load -r lsn` on large DB_HASH files (>700MB) like sceneobjects.db — it silently corrupts them.
+
+**Why this only affects small databases:** `sceneobjects.db` is typically written through a raw BDB writer (TargetDB) that bypasses the transaction log system entirely. Small databases like guilds go through `ObjectDatabaseManager` which uses write-ahead logging and requires a checkpoint to persist data to `.db` file pages.
+
 ### "LSN past end of log" on core3 startup
 
 Phase 4 was not run, or was run incorrectly. Re-run `./dbconvert finalize` (requires Phase 3 complete) or run the full pipeline again from Phase 1.
@@ -492,6 +536,7 @@ Phase 4 was not run, or was run incorrectly. Re-run `./dbconvert finalize` (requ
 - A working SWGEmu Core3 build environment (GCC/Clang, CMake, BerkeleyDB 5.3, Boost)
 - Server must build and run successfully before adding dbconvert
 - Python 3 (for `patch_autogen.py`)
+- `conf/config.lua` must exist in the working directory — dbconvert loads it on startup for BDB environment configuration. Run dbconvert from the `bin/` directory where both `databases/` and `conf/` are located.
 
 ---
 
