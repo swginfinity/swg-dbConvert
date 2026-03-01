@@ -382,25 +382,60 @@ static int phaseClean() {
 
 	// Collect file lists
 	Vector<String> envFiles;
+	Vector<String> logFiles;
 	Vector<String> dbFiles;
 	struct dirent* entry;
 
 	while ((entry = readdir(dir)) != nullptr) {
 		String filename = entry->d_name;
 		if (filename == "." || filename == "..") continue;
-		if (filename.beginsWith("__db.") || filename.beginsWith("log."))
+		if (filename.beginsWith("__db."))
 			envFiles.add(filename);
+		else if (filename.beginsWith("log."))
+			logFiles.add(filename);
 		else if (filename.endsWith(".db"))
 			dbFiles.add(filename);
 	}
 	closedir(dir);
 
-	// Remove environment files
+	// If transaction logs exist, replay them before removal.
+	// Data written via ObjectDatabaseManager (guilds, chatrooms, etc.) may
+	// only exist in log files if the writer never checkpointed. Opening with
+	// DB_RECOVER replays the logs into the .db pages, then we checkpoint to
+	// flush them to disk. Without this, removing log.* destroys that data.
+	if (logFiles.size() > 0) {
+		System::out << "  Found " << logFiles.size() << " transaction log(s) — recovering before cleanup..." << endl;
+
+		DB_ENV* recEnv = nullptr;
+		int recRet = db_env_create(&recEnv, 0);
+		if (recRet == 0) {
+			recRet = recEnv->open(recEnv, DB_DIR,
+				DB_CREATE | DB_INIT_MPOOL | DB_INIT_LOG | DB_INIT_TXN | DB_RECOVER, 0);
+			if (recRet == 0) {
+				recEnv->txn_checkpoint(recEnv, 0, 0, DB_FORCE);
+				System::out << "  Recovery checkpoint complete (dirty pages flushed)" << endl;
+				recEnv->close(recEnv, 0);
+			} else {
+				System::out << "  WARNING: Could not open environment for recovery (ret=" << recRet << ")" << endl;
+				System::out << "  Proceeding with cleanup — verify small databases (guilds, etc.) after conversion" << endl;
+				recEnv->close(recEnv, 0);
+			}
+		}
+	}
+
+	// Remove environment and log files
+	int removedCount = 0;
 	for (int i = 0; i < envFiles.size(); ++i) {
 		String fullPath = String(DB_DIR) + "/" + envFiles.get(i);
 		remove(fullPath.toCharArray());
+		removedCount++;
 	}
-	System::out << "  Removed " << envFiles.size() << " environment files (__db.*, log.*)" << endl;
+	for (int i = 0; i < logFiles.size(); ++i) {
+		String fullPath = String(DB_DIR) + "/" + logFiles.get(i);
+		remove(fullPath.toCharArray());
+		removedCount++;
+	}
+	System::out << "  Removed " << removedCount << " environment files (__db.*, log.*)" << endl;
 
 	// Reset LSNs in all .db files using a private environment
 	DB_ENV* dbenv = nullptr;

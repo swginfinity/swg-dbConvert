@@ -30,8 +30,8 @@ Two modes are available:
 
 Prepares databases for a fresh BDB environment:
 
-1. Remove `__db.*` files (shared memory regions)
-2. Remove `log.*` files (transaction logs from previous environment)
+1. If `log.*` files exist, open the BDB environment with `DB_RECOVER` and force a checkpoint — this replays any uncommitted transaction log data into the `.db` file pages before the logs are removed. Without this step, data written by tools that didn't checkpoint (e.g., small databases like guilds, chatrooms) would be permanently lost when the logs are deleted.
+2. Remove `__db.*` files (shared memory regions) and `log.*` files (transaction logs)
 3. Create a private BDB environment and call `lsn_reset()` on each `.db` file
 4. Remove any leftover `__db.*` from the reset
 5. Clear stale phase manifests and `.converted` files from previous runs
