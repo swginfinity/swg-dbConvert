@@ -429,6 +429,23 @@ Custom C++ types are converted automatically as long as:
 
 Databases with "index" in the name are **skipped** — core3 rebuilds them at boot.
 
+### Databases to Delete Before Conversion
+
+These databases are rebuilt from scratch by core3 on every boot. Deleting them before conversion saves time and avoids unnecessary errors:
+
+```bash
+cd MMOCoreORB/bin/databases
+rm -f navareas.db spawnareas.db clientobjects.db
+```
+
+| Database | Purpose | Why delete |
+|----------|---------|------------|
+| `navareas.db` | Navigation mesh areas | Rebuilt from navmesh data at boot |
+| `spawnareas.db` | Spawn region definitions | Rebuilt from Lua spawn scripts at boot |
+| `clientobjects.db` | Client-side object cache | Rebuilt from templates at boot |
+
+These contain no player data and are never worth converting.
+
 ---
 
 ## Helper Scripts

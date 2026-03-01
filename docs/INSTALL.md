@@ -192,9 +192,16 @@ BDB environment simultaneously.
 
 dbconvert must be run from the `bin/` directory where `databases/` and `conf/config.lua` are located. The tool loads `conf/config.lua` (and optionally `conf/config-local.lua`) on startup for BDB environment configuration.
 
+First, delete databases that are rebuilt from scratch on every boot — converting them wastes time:
+
 ```bash
 cd MMOCoreORB/bin
+rm -f databases/navareas.db databases/spawnareas.db databases/clientobjects.db
+```
 
+Then run the conversion:
+
+```bash
 # Convert all databases (classic mode — converts everything)
 ./dbconvert all
 
