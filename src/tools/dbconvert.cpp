@@ -473,12 +473,18 @@ static int phaseClean() {
 	removeManifest(MANIFEST_PHASE3);
 
 	// Remove stale per-database .converted manifests
+	// NOTE: Can't use String::endsWith() due to a bug in engine3 where it returns
+	// true when the suffix is longer than the string (both produce -1 comparison).
+	// Use std::string instead for reliable suffix matching.
 	dir = opendir(DB_DIR);
 	if (dir) {
 		while ((entry = readdir(dir)) != nullptr) {
-			String filename = entry->d_name;
-			if (filename.endsWith(".converted")) {
-				String fullPath = String(DB_DIR) + "/" + filename;
+			std::string filename(entry->d_name);
+			const std::string suffix = ".converted";
+			bool endsWithConverted = filename.size() >= suffix.size() &&
+				filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
+			if (endsWithConverted) {
+				String fullPath = String(DB_DIR) + "/" + entry->d_name;
 				remove(fullPath.toCharArray());
 			}
 		}
@@ -1128,13 +1134,19 @@ static int phaseFinalize() {
 	removeManifest(MANIFEST_PHASE3);
 
 	// Remove per-database .converted manifests
+	// NOTE: Can't use String::endsWith() due to a bug in engine3 where it returns
+	// true when the suffix is longer than the string (both produce -1 comparison).
+	// Use std::string instead for reliable suffix matching.
 	dir = opendir(DB_DIR);
 	if (dir) {
 		struct dirent* entry;
 		while ((entry = readdir(dir)) != nullptr) {
-			String filename = entry->d_name;
-			if (filename.endsWith(".converted")) {
-				String fullPath = String(DB_DIR) + "/" + filename;
+			std::string filename(entry->d_name);
+			const std::string suffix = ".converted";
+			bool endsWithConverted = filename.size() >= suffix.size() &&
+				filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
+			if (endsWithConverted) {
+				String fullPath = String(DB_DIR) + "/" + entry->d_name;
 				remove(fullPath.toCharArray());
 			}
 		}
