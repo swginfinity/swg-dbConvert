@@ -72,7 +72,9 @@ Each object is loaded through the full C++ deserialization chain (`ObjectManager
 
 **Classic mode:** Converts every record in every database.
 
-**Smart mode:** Uses metadata from Phase 2 to decide per class:
+**Smart mode:** Uses metadata from Phase 2 to selectively skip unchanged classes in `sceneobjects` (the only database large enough to benefit). All other databases are fully reserialized regardless of mode.
+
+For `sceneobjects`:
 
 1. **Quorum probe** — for each unique `_className`, load up to 40 records (first 20 + last 20 OIDs from Phase 2). For each: load, reserialize, compare bytes with current BDB data.
 2. If **any** of the 40 probe records differ, the entire class is marked `RESERIALIZE`.
@@ -495,35 +497,55 @@ grep -r "MANAGED_REFERENCE_LOAD.*initializeTransientMembers" src/autogen/ | wc -
 
 Should match ~325.
 
-### guilds.db (or other small databases) empty after conversion
+### guilds.db (or other small databases) broken after conversion
 
-dbconvert converts databases **in place** in the `databases/` directory. It does not copy databases from a separate source directory.
+Phase 3 (reserialize) can occasionally corrupt small databases like guilds, chatrooms, or surveys. Symptoms include players not being in guilds on login, guild terminals showing no guilds, or similar missing data.
 
-If you migrated databases from an older server version by copying files, the small databases (guilds, chatrooms, surveys, etc.) may appear empty if the original copy was made without a proper BDB checkpoint. This happens because BDB's write-ahead logging stores data in transaction log files (`log.*`) first, and only flushes to `.db` file pages during checkpoints. If the log files were removed before a checkpoint, the data is lost.
+**The fix:** Replace the broken database with the pre-reserialize version (after Phase 1+2 but before Phase 3 damaged it) using a dump/load cycle to create a clean BDB file.
 
-**To recover guilds from a backup that has intact data:**
+**Step 1: Locate the pre-reserialize backup.** If you used `scripts/backup.sh` before conversion, use that. Otherwise, if you still have the Phase 1+2 output (before Phase 3 ran), use that copy.
+
+**Step 2: Dump, swap, and load.**
 
 ```bash
 cd MMOCoreORB/bin
 
-# Dump from source (backup must have data — verify with db5.3_stat -d first)
-db5.3_stat -d /path/to/backup/guilds.db | grep "Number of keys"
-db5.3_dump /path/to/backup/guilds.db > /tmp/guilds_dump.txt
+# Stop core3 if running
 
-# Load into target
+# Verify the clean copy has data
+db5.3_stat -d /path/to/clean/guilds.db | grep "Number of keys"
+
+# Dump the clean copy to text format
+db5.3_dump /path/to/clean/guilds.db > /tmp/guilds_dump.txt
+
+# Remove the broken database (db5.3_load will NOT overwrite existing files)
+rm -f databases/guilds.db
+
+# Load into a fresh database file
 db5.3_load -f /tmp/guilds_dump.txt databases/guilds.db
 
-# Reset LSNs so it works in the current BDB environment
-db5.3_load -r lsn databases/guilds.db
+# Remove stale shared memory regions
+rm -f databases/__db.*
+
+# Do NOT remove log.* files — other databases need them to boot
 
 # Verify
 db5.3_stat -d databases/guilds.db | grep "Number of keys"
 db5.3_verify databases/guilds.db
+
+# Start the server
+./core3
 ```
 
-This works safely for small databases. Do **not** use `db5.3_load -r lsn` on large DB_HASH files (>700MB) like sceneobjects.db — it silently corrupts them.
+**Why this works:** The `db5.3_dump` → `db5.3_load` cycle creates a brand new BDB file with zeroed page LSNs. When core3 starts with `DB_RECOVER`, pages with LSN 0 are treated as "never modified in the current log sequence" — recovery skips them. The existing `log.*` files remain valid for all other databases.
 
-**Why this only affects small databases:** `sceneobjects.db` is typically written through a raw BDB writer (TargetDB) that bypasses the transaction log system entirely. Small databases like guilds go through `ObjectDatabaseManager` which uses write-ahead logging and requires a checkpoint to persist data to `.db` file pages.
+**Critical details:**
+- **You must `rm -f` the broken file first** — `db5.3_load` refuses to overwrite existing files and fails silently.
+- **Do not remove `log.*` files** — other databases have page LSNs referencing them. Removing logs causes "LSN past end of log" crashes on boot.
+- **Do not use `db5.3_load -r lsn`** — it's unnecessary (the dump/load already creates clean LSNs) and the CLI tool silently corrupts large DB_HASH files (>700MB) like sceneobjects.db.
+- **Remove `__db.*` files** — these are stale shared memory regions from the previous core3/dbconvert run.
+
+**Why this only affects small databases:** `sceneobjects.db` is written through a raw BDB writer (TargetDB) that bypasses the transaction log system entirely. Small databases like guilds go through `ObjectDatabaseManager` which uses write-ahead logging — making them more sensitive to the reserialize round-trip.
 
 ### "LSN past end of log" on core3 startup
 

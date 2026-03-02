@@ -792,10 +792,15 @@ static int phaseReserialize(bool smartMode,
 			continue;
 		}
 
-		// ── Smart mode: quorum probe ──
+		// ── Smart mode: quorum probe (sceneobjects only) ──
+		// Smart mode probing only makes sense for sceneobjects where skipping
+		// unchanged classes saves significant time (90%+ of 1M+ records).
+		// Small databases like guilds, chatrooms, etc. are always fully
+		// reserialized — the probe's error handling (treat failures as CLEAN)
+		// can silently skip records that actually need conversion.
 		std::unordered_map<std::string, bool> classNeedsReserialize;
 
-		if (smartMode && allClassMaps != nullptr) {
+		if (smartMode && allClassMaps != nullptr && currentDb == "sceneobjects") {
 			auto dbMapIt = allClassMaps->find(std::string(currentDb.toCharArray()));
 			if (dbMapIt != allClassMaps->end()) {
 				auto& classMap = dbMapIt->second;
