@@ -2,6 +2,15 @@
 
 A standalone offline tool for migrating SWGEmu Berkeley DB databases between server code versions. Built for the SWGEmu Core3 engine.
 
+> **WARNING: This tool modifies your databases in place. Incorrect use will permanently destroy player data.**
+>
+> - **Always back up your databases before running this tool.** No backup = no recovery.
+> - **Test the full conversion on a copy of your production data first.** Do not run this against a live production database until you have verified the results on a test environment.
+> - **Verify the converted server boots cleanly and players can log in** before deleting your backup.
+> - **Read the [Core3 source changes](docs/CORE3_CHANGES.md) carefully.** Missing even one change can silently zero out template CRCs, erase player skills, or wipe zone data — with no errors during conversion.
+>
+> This tool has been tested extensively on databases ranging from 1M to 65M objects, but every server has different custom content and code modifications. Your setup may surface edge cases that haven't been seen before. Test first. Then test again.
+
 ## The Problem
 
 SWGEmu stores all game objects (players, buildings, items, creatures) as serialized C++ objects in Berkeley DB. When the server code changes — renamed fields, new fields, removed fields, different class hierarchies — the bytes stored in BDB no longer match what the current code expects.
