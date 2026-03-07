@@ -1,5 +1,5 @@
 /*
- * Infinity Database Converter — 4-Phase Pipeline
+ * SWGEmu Database Converter — 4-Phase Pipeline
  *
  * Converts SWGEmu Berkeley DB databases between server code versions.
  * Designed for the QuadTreeEntry → TreeEntry migration but extensible
@@ -161,7 +161,7 @@ static void openErrorLog() {
 	errorLog = fopen(logPath, "w");
 	if (errorLog) {
 		time_t now = time(nullptr);
-		fprintf(errorLog, "# Infinity Database Converter - Error Log\n");
+		fprintf(errorLog, "# SWGEmu Database Converter - Error Log\n");
 		fprintf(errorLog, "# Started: %s", ctime(&now));
 		fprintf(errorLog, "#\n");
 		fflush(errorLog);
@@ -212,6 +212,9 @@ static void initEngine() {
 	Core::setIntProperty("BerkeleyDB.envMaxLocks", 15000000);
 	Core::setIntProperty("BerkeleyDB.envMaxLockers", 15000000);
 	Core::setIntProperty("BerkeleyDB.envMaxLockObjects", 15000000);
+
+	// Disable update threads — dbconvert is single-threaded, writes directly to BDB
+	Core::setIntProperty("ObjectManager.initialUpdateModifiedObjectsThreads", 0);
 
 	// Open BDB environment and load database registry (databases.db)
 	ObjectDatabaseManager::instance()->loadDatabases(false);
@@ -1193,7 +1196,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	if (subCmd.isEmpty()) {
-		System::out << "Infinity Database Converter — 4-Phase Pipeline" << endl;
+		System::out << "SWGEmu Database Converter — 4-Phase Pipeline" << endl;
 		System::out << endl;
 		System::out << "Full pipeline:" << endl;
 		System::out << "  ./dbconvert all                  Run all phases (classic)" << endl;
@@ -1224,7 +1227,7 @@ int main(int argc, char* argv[]) {
 
 		if (subCmd == "all") {
 			System::out << "================================================================" << endl;
-			System::out << "  Infinity Database Converter" << endl;
+			System::out << "  SWGEmu Database Converter" << endl;
 			System::out << "  Mode: " << (smartMode ? "Smart (selective reserialize)" : "Classic (full reserialize)") << endl;
 			System::out << "  Running all phases: clean → hashfix → reserialize → finalize" << endl;
 			System::out << "================================================================" << endl;

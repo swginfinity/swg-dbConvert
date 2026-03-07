@@ -18,7 +18,9 @@
 #
 # ADD the following immediately after:
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/dbconvert.cpp")
 add_executable(dbconvert EXCLUDE_FROM_ALL tools/dbconvert.cpp server/ServerCore.cpp ${tre3_sources} ${tre3_headers} ${zone3_sources} ${zone3_headers})
+endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SECTION 2: Add dependencies (after core3 dependencies)
@@ -28,7 +30,9 @@ add_executable(dbconvert EXCLUDE_FROM_ALL tools/dbconvert.cpp server/ServerCore.
 #
 # ADD the following immediately after:
 
+if(TARGET dbconvert)
 add_dependencies(dbconvert engine3 idlobjects)
+endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SECTION 3: Add link libraries (after core3's link libs + jemalloc + gold)
@@ -41,6 +45,7 @@ add_dependencies(dbconvert engine3 idlobjects)
 # ADD the following block after core3's gold linker conditional:
 
 # dbconvert link libraries (same as core3)
+if(TARGET dbconvert)
 target_link_libraries(dbconvert
     ${whole_archive_start}
     db3 conf3 web3 status3 ping3 login3 chat3 core3terrain core3templates core3pathfinding idlobjects
@@ -66,3 +71,4 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy
     $<TARGET_FILE:dbconvert>
     ${CMAKE_SOURCE_DIR}/bin/)
+endif()

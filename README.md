@@ -190,17 +190,17 @@ rm databases/sceneobjects.converted
 
 ## Performance
 
-On a production dataset with ~1M objects across 30 databases:
+Scales from small dev databases to large production datasets. Phase 2 (hashfix) is I/O-bound; Phase 3 (reserialize) is CPU-bound.
 
-| Phase | Time | Rate |
-|-------|------|------|
-| Phase 1 (clean) | ~2s | — |
-| Phase 2 (hashfix) | ~30s | 500K records/sec |
-| Phase 3 classic (reserialize all) | ~90s | 12K objects/sec |
-| Phase 3 smart (selective) | ~10s | skips 90%+ of records |
-| Phase 4 (finalize) | ~3s | — |
-| **Total (classic)** | **~2 min** | — |
-| **Total (smart)** | **~45s** | — |
+| Phase | ~1M objects | ~65M objects |
+|-------|-------------|--------------|
+| Phase 1 (clean) | ~2s | ~5s |
+| Phase 2 (hashfix) | ~30s (~500K/s) | ~2 min (~500K/s) |
+| Phase 3 classic | ~90s (~12K/s) | ~13 min (~84K/s) |
+| Phase 3 smart | ~10s (skips 90%+) | ~1 min (skips 90%+) |
+| Phase 4 (finalize) | ~3s | ~5s |
+| **Total (classic)** | **~2 min** | **~15 min** |
+| **Total (smart)** | **~45s** | **~3 min** |
 
 Memory usage stays bounded regardless of database size thanks to the 500-object batch eviction pattern.
 

@@ -1,7 +1,7 @@
 /*
  * Example main.cpp showing how to redirect ./core3 convert to ./dbconvert
  *
- * This is a complete, working main.cpp from an Infinity server.
+ * This is a complete, working main.cpp from an SWGEmu server.
  * Your main.cpp will likely have additional argument handlers —
  * just add the "convert" block in the else-if chain.
  *
@@ -120,11 +120,12 @@ int main(int argc, char* argv[]) {
 			System::out << "Database conversion has moved to the standalone tool." << endl;
 			System::out << endl;
 			System::out << "Usage:" << endl;
-			System::out << "  ./dbconvert all              - convert all databases" << endl;
-			System::out << "  ./dbconvert <database>       - convert single database" << endl;
-			System::out << "  ./dbconvert sample <db>      - convert 1 record per class type" << endl;
-			System::out << "  ./dbconvert hashonly [db]    - hash fix only (skip round-trip)" << endl;
-			System::out << "  ./dbconvert clean            - reset BDB LSNs" << endl;
+			System::out << "  ./dbconvert all              - run all phases (classic)" << endl;
+			System::out << "  ./dbconvert all --smart      - run all phases (smart, selective)" << endl;
+			System::out << "  ./dbconvert clean            - Phase 1: reset BDB LSNs" << endl;
+			System::out << "  ./dbconvert hashfix          - Phase 2: byte-level hash replacement" << endl;
+			System::out << "  ./dbconvert reserialize      - Phase 3: C++ round-trip" << endl;
+			System::out << "  ./dbconvert finalize         - Phase 4: checkpoint + cleanup" << endl;
 			System::out << endl;
 			System::out << "  ./core3 convert navmesh [zone]  - rebuild navmeshes (still in core3)" << endl;
 			_exit(1);

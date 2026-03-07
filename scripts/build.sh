@@ -16,7 +16,7 @@
 #   ./build.sh <path_to_MMOCoreORB>
 #
 # Example:
-#   ./build.sh /home/swgemu/workspace/infinity_jtl/MMOCoreORB
+#   ./build.sh /path/to/MMOCoreORB
 #
 # Prerequisites:
 #   - Server source must be fully built (core3 compiles successfully)
@@ -36,7 +36,7 @@ if [ $# -lt 1 ]; then
     echo "Builds the dbconvert standalone database converter."
     echo ""
     echo "Example:"
-    echo "  $0 /home/swgemu/workspace/infinity_jtl/MMOCoreORB"
+    echo "  $0 /path/to/MMOCoreORB"
     exit 1
 fi
 
