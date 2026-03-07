@@ -99,8 +99,14 @@ cleanup() {
         echo "  CMakeLists.txt restored"
     fi
 
-    # Note: we leave dbconvert.cpp in place (harmless, excluded from core3 build)
-    # and we leave the autogen patches (they get overwritten on next IDL rebuild)
+    if [ "$DBCONVERT_COPIED" = true ] && [ -f "$SRC_DIR/tools/dbconvert.cpp" ]; then
+        echo "Removing dbconvert.cpp from source tree..."
+        rm -f "$SRC_DIR/tools/dbconvert.cpp"
+        rmdir "$SRC_DIR/tools" 2>/dev/null || true
+        echo "  dbconvert.cpp removed"
+    fi
+
+    # Note: we leave the autogen patches (they get overwritten on next IDL rebuild)
 }
 
 # Always clean up on exit
