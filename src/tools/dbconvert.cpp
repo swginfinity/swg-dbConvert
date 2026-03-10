@@ -349,8 +349,8 @@ static std::vector<DbEntry> discoverDatabases() {
 		if (name.beginsWith("__") || name.contains("index") || name == "databases")
 			continue;
 
-		// Delete client-only databases (rebuilt by the server at boot)
-		if (name == "clientobjects" || name == "navareas") {
+		// Delete ephemeral databases (rebuilt by the server at boot)
+		if (name == "clientobjects" || name == "navareas" || name == "buffs") {
 			char delPath[512];
 			snprintf(delPath, sizeof(delPath), "%s/%s", DB_DIR, filename.toCharArray());
 			if (remove(delPath) == 0)
