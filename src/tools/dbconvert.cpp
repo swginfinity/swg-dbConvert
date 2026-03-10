@@ -345,18 +345,12 @@ static std::vector<DbEntry> discoverDatabases() {
 		if (!filename.endsWith(".db") || filename.length() <= 3)
 			continue;
 		String name = filename.subString(0, filename.length() - 3);
-		// Skip BDB internal files and index databases (rebuilt at boot)
+		// Skip BDB internal files, index databases, and ephemeral databases
+		// (ephemeral ones are deleted in Phase 1, but skip if still present)
 		if (name.beginsWith("__") || name.contains("index") || name == "databases")
 			continue;
-
-		// Delete ephemeral databases (rebuilt by the server at boot)
-		if (name == "clientobjects" || name == "navareas" || name == "buffs") {
-			char delPath[512];
-			snprintf(delPath, sizeof(delPath), "%s/%s", DB_DIR, filename.toCharArray());
-			if (remove(delPath) == 0)
-				System::out << "  Deleted " << name << ".db (rebuilt at boot)" << endl;
+		if (name == "clientobjects" || name == "navareas" || name == "buffs")
 			continue;
-		}
 
 		struct stat st;
 		char path[512];
@@ -398,6 +392,9 @@ static int phaseClean() {
 	Vector<String> dbFiles;
 	struct dirent* entry;
 
+	// Ephemeral databases rebuilt by the server at boot — delete before any processing
+	static const char* EPHEMERAL_DBS[] = { "clientobjects", "navareas", "buffs", nullptr };
+
 	while ((entry = readdir(dir)) != nullptr) {
 		String filename = entry->d_name;
 		if (filename == "." || filename == "..") continue;
@@ -405,8 +402,24 @@ static int phaseClean() {
 			envFiles.add(filename);
 		else if (filename.beginsWith("log."))
 			logFiles.add(filename);
-		else if (filename.endsWith(".db"))
-			dbFiles.add(filename);
+		else if (filename.endsWith(".db")) {
+			String name = filename.subString(0, filename.length() - 3);
+			bool ephemeral = false;
+			for (int e = 0; EPHEMERAL_DBS[e]; e++) {
+				if (name == EPHEMERAL_DBS[e]) {
+					ephemeral = true;
+					break;
+				}
+			}
+			if (ephemeral) {
+				char delPath[512];
+				snprintf(delPath, sizeof(delPath), "%s/%s", DB_DIR, filename.toCharArray());
+				if (remove(delPath) == 0)
+					System::out << "  Deleted " << name << ".db (ephemeral, rebuilt at boot)" << endl;
+			} else {
+				dbFiles.add(filename);
+			}
+		}
 	}
 	closedir(dir);
 
