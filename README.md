@@ -39,12 +39,13 @@ Two modes are available:
 
 Prepares databases for a fresh BDB environment:
 
-1. If `log.*` files exist, open the BDB environment with `DB_RECOVER` and force a checkpoint — this replays any uncommitted transaction log data into the `.db` file pages before the logs are removed. Without this step, data written by tools that didn't checkpoint (e.g., small databases like guilds, chatrooms) would be permanently lost when the logs are deleted.
-2. Remove `__db.*` files (shared memory regions) and `log.*` files (transaction logs)
-3. Create a private BDB environment and call `lsn_reset()` on each `.db` file
-4. Remove any leftover `__db.*` from the reset
-5. Clear stale phase manifests and `.converted` files from previous runs
-6. Write `.phase1_complete` manifest
+1. Checkpoint the existing BDB environment (flushes dirty pages from transaction logs into `.db` files)
+2. If `log.*` files exist and checkpoint couldn't open the environment, fall back to `DB_RECOVER` to replay uncommitted transaction log data into the `.db` file pages before the logs are removed
+3. Remove `__db.*` files (shared memory regions) and `log.*` files (transaction logs)
+4. Create a private BDB environment and call `lsn_reset()` on each `.db` file
+5. Remove any leftover `__db.*` from the reset
+6. Clear stale phase manifests and `.converted` files from previous runs
+7. Write `.phase1_complete` manifest
 
 ### Phase 2: Hash Fix
 
@@ -123,22 +124,18 @@ Proper BDB cleanup using engine3's checkpoint API:
 ## Quick Start
 
 ```bash
-# 1. Checkpoint your databases (flushes dirty pages from transaction logs into .db files)
-cd /path/to/MMOCoreORB/bin
-db5.3_checkpoint -1 -h databases
-
-# 2. Back up your databases (always!)
+# 1. Back up your databases (always!)
 ./scripts/backup.sh pre_convert /path/to/MMOCoreORB/bin/databases
 
-# 3. Build dbconvert (patches engine3 temporarily, reverts when done)
+# 2. Build dbconvert (patches engine3 temporarily, reverts when done)
 ./scripts/build.sh /path/to/MMOCoreORB
 
-# 4. Stop core3 if running, then convert
+# 3. Stop core3 if running, then convert
 cd /path/to/MMOCoreORB/bin
 ./dbconvert all              # Classic mode (safe, converts everything)
 ./dbconvert all --smart      # Smart mode (probes per class, skips unchanged)
 
-# 5. Start the server — zero dirty objects on first boot
+# 4. Start the server — zero dirty objects on first boot
 ./core3
 ```
 
@@ -461,6 +458,7 @@ The tool automatically deletes these databases during discovery since they are r
 | `clientobjects.db` | Client-side object cache | Rebuilt from templates at boot |
 | `navareas.db` | Navigation mesh areas | Rebuilt from navmesh data at boot |
 | `buffs.db` | Active buff state | Ephemeral — rebuilt at boot, no player data |
+| `strings.db` | String cache | Fails to create via ObjectDatabaseManager — non-critical |
 
 These contain no persistent player data and are never worth converting. You may also want to manually delete `spawnareas.db` (rebuilt from Lua spawn scripts at boot) before conversion.
 
@@ -594,23 +592,13 @@ Phase 4 was not run, or was run incorrectly. Re-run `./dbconvert finalize` (requ
 
 ---
 
-## Checkpoint Before You Start
+## Automatic Checkpoint
 
-**Always checkpoint your databases before running dbconvert.** BDB uses write-ahead logging — recent writes may exist only in `log.*` transaction log files and not yet be flushed to the `.db` files. A checkpoint forces all dirty pages to disk, ensuring the `.db` files contain the latest data.
+Phase 1 automatically checkpoints the existing BDB environment before doing anything else. This flushes any dirty pages from transaction logs into the `.db` files, ensuring no data is lost when the logs are removed later.
 
-```bash
-cd /path/to/MMOCoreORB/bin
+The checkpoint runs against the existing environment (equivalent to `db5.3_checkpoint -1 -h databases`). If the environment can't be opened (e.g., first run, or incompatible environment), Phase 1 falls back to `DB_RECOVER` to replay transaction logs before cleanup.
 
-# Stop core3 first — never checkpoint while the server is running
-# Then force a single checkpoint:
-db5.3_checkpoint -1 -h databases
-```
-
-The `-1` flag forces a single checkpoint and exits. The `-h` flag specifies the BDB environment directory.
-
-**What happens if you skip this:** Phase 1 (clean) does attempt a `DB_RECOVER` checkpoint if log files are present, which replays uncommitted data. However, if recovery fails or the log files are corrupt, any data that only existed in the logs is permanently lost. An explicit checkpoint before starting is cheap insurance.
-
-After checkpointing, back up the databases with `scripts/backup.sh` before proceeding.
+**Stop core3 before running dbconvert** — checkpointing while the server is running can corrupt the environment.
 
 ---
 

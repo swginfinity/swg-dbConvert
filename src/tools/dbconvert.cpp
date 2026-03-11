@@ -349,7 +349,7 @@ static std::vector<DbEntry> discoverDatabases() {
 		// (ephemeral ones are deleted in Phase 1, but skip if still present)
 		if (name.beginsWith("__") || name.contains("index") || name == "databases")
 			continue;
-		if (name == "clientobjects" || name == "navareas" || name == "buffs")
+		if (name == "clientobjects" || name == "navareas" || name == "buffs" || name == "strings")
 			continue;
 
 		struct stat st;
@@ -386,6 +386,31 @@ static int phaseClean() {
 		return 1;
 	}
 
+	// Checkpoint the existing environment first — flushes any dirty pages from
+	// transaction logs into .db files while the environment is still intact.
+	// This is equivalent to running `db5.3_checkpoint -1 -h databases` and
+	// ensures no data is lost when we remove log files later.
+	{
+		DB_ENV* ckpEnv = nullptr;
+		int ckpRet = db_env_create(&ckpEnv, 0);
+		if (ckpRet == 0) {
+			ckpRet = ckpEnv->open(ckpEnv, DB_DIR,
+				DB_INIT_MPOOL | DB_INIT_LOG | DB_INIT_TXN | DB_USE_ENVIRON, 0);
+			if (ckpRet == 0) {
+				ckpRet = ckpEnv->txn_checkpoint(ckpEnv, 0, 0, DB_FORCE);
+				if (ckpRet == 0)
+					System::out << "  Checkpoint complete (dirty pages flushed to .db files)" << endl;
+				else
+					System::out << "  WARNING: Checkpoint returned " << ckpRet << " — will attempt recovery" << endl;
+				ckpEnv->close(ckpEnv, 0);
+			} else {
+				// Environment doesn't exist yet or is incompatible — that's fine,
+				// the DB_RECOVER path below will handle it
+				ckpEnv->close(ckpEnv, 0);
+			}
+		}
+	}
+
 	// Collect file lists
 	Vector<String> envFiles;
 	Vector<String> logFiles;
@@ -393,7 +418,7 @@ static int phaseClean() {
 	struct dirent* entry;
 
 	// Ephemeral databases rebuilt by the server at boot — delete before any processing
-	static const char* EPHEMERAL_DBS[] = { "clientobjects", "navareas", "buffs", nullptr };
+	static const char* EPHEMERAL_DBS[] = { "clientobjects", "navareas", "buffs", "strings", nullptr };
 
 	while ((entry = readdir(dir)) != nullptr) {
 		String filename = entry->d_name;
