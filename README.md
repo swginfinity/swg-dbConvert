@@ -123,18 +123,22 @@ Proper BDB cleanup using engine3's checkpoint API:
 ## Quick Start
 
 ```bash
-# 1. Back up your databases (always!)
+# 1. Checkpoint your databases (flushes dirty pages from transaction logs into .db files)
+cd /path/to/MMOCoreORB/bin
+db5.3_checkpoint -1 -h databases
+
+# 2. Back up your databases (always!)
 ./scripts/backup.sh pre_convert /path/to/MMOCoreORB/bin/databases
 
-# 2. Build dbconvert (patches engine3 temporarily, reverts when done)
+# 3. Build dbconvert (patches engine3 temporarily, reverts when done)
 ./scripts/build.sh /path/to/MMOCoreORB
 
-# 3. Stop core3 if running, then convert
+# 4. Stop core3 if running, then convert
 cd /path/to/MMOCoreORB/bin
 ./dbconvert all              # Classic mode (safe, converts everything)
 ./dbconvert all --smart      # Smart mode (probes per class, skips unchanged)
 
-# 4. Start the server — zero dirty objects on first boot
+# 5. Start the server — zero dirty objects on first boot
 ./core3
 ```
 
@@ -587,6 +591,26 @@ db5.3_verify databases/guilds.db
 ### "LSN past end of log" on core3 startup
 
 Phase 4 was not run, or was run incorrectly. Re-run `./dbconvert finalize` (requires Phase 3 complete) or run the full pipeline again from Phase 1.
+
+---
+
+## Checkpoint Before You Start
+
+**Always checkpoint your databases before running dbconvert.** BDB uses write-ahead logging — recent writes may exist only in `log.*` transaction log files and not yet be flushed to the `.db` files. A checkpoint forces all dirty pages to disk, ensuring the `.db` files contain the latest data.
+
+```bash
+cd /path/to/MMOCoreORB/bin
+
+# Stop core3 first — never checkpoint while the server is running
+# Then force a single checkpoint:
+db5.3_checkpoint -1 -h databases
+```
+
+The `-1` flag forces a single checkpoint and exits. The `-h` flag specifies the BDB environment directory.
+
+**What happens if you skip this:** Phase 1 (clean) does attempt a `DB_RECOVER` checkpoint if log files are present, which replays uncommitted data. However, if recovery fails or the log files are corrupt, any data that only existed in the logs is permanently lost. An explicit checkpoint before starting is cheap insurance.
+
+After checkpointing, back up the databases with `scripts/backup.sh` before proceeding.
 
 ---
 
