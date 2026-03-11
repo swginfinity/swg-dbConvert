@@ -1240,8 +1240,7 @@ int main(int argc, char* argv[]) {
 		System::out << "  ./dbconvert all                  Run all phases (classic)" << endl;
 		System::out << "  ./dbconvert all --smart          Run all phases (smart, selective reserialize)" << endl;
 		System::out << endl;
-		System::out << "Individual phases (must run in order):" << endl;
-		System::out << "  ./dbconvert clean                Phase 1: Strip BDB LSNs, clean environment" << endl;
+		System::out << "Individual phases (clean always runs automatically first):" << endl;
 		System::out << "  ./dbconvert hashfix              Phase 2: Byte-level hash replacement" << endl;
 		System::out << "  ./dbconvert hashfix --smart      Phase 2: Hash replacement + metadata scan" << endl;
 		System::out << "  ./dbconvert reserialize          Phase 3: C++ round-trip (all records)" << endl;
@@ -1298,13 +1297,18 @@ int main(int argc, char* argv[]) {
 			System::out << "  Run './core3' to start the server." << endl;
 			System::out << "================================================================" << endl;
 
-		} else if (subCmd == "clean") {
-			ret = phaseClean();
-
 		} else if (subCmd == "hashfix") {
+			ret = phaseClean();
+			if (ret != 0) { System::out << "Auto-clean failed." << endl; _exit(ret); }
+			System::out << endl;
+
 			ret = phaseHashfix(smartMode, smartMode ? &allClassMaps : nullptr);
 
 		} else if (subCmd == "reserialize") {
+			ret = phaseClean();
+			if (ret != 0) { System::out << "Auto-clean failed." << endl; _exit(ret); }
+			System::out << endl;
+
 			// If running standalone in smart mode, we need to re-scan for metadata
 			// since Phase 2 data isn't available. Re-run hashfix scan (no-op on
 			// already-fixed hashes, but collects metadata).
@@ -1373,6 +1377,10 @@ int main(int argc, char* argv[]) {
 			ret = phaseReserialize(smartMode, smartMode ? &allClassMaps : nullptr);
 
 		} else if (subCmd == "finalize") {
+			ret = phaseClean();
+			if (ret != 0) { System::out << "Auto-clean failed." << endl; _exit(ret); }
+			System::out << endl;
+
 			ret = phaseFinalize();
 
 		} else {
