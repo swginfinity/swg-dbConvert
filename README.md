@@ -27,6 +27,21 @@ A standalone offline tool for migrating SWGEmu Berkeley DB databases between ser
 >
 > This tool has been tested extensively on databases ranging from 1M to 65M objects, but every server has different custom content and code modifications. Your setup may surface edge cases that haven't been seen before. Test first. Then test again.
 
+## What This Tool Does NOT Do
+
+This tool **only** converts your existing database so the stored bytes match your updated server code. That's it.
+
+It does **not**:
+
+- **Add JTL (Jump to Lightspeed) code to your server** — you must merge or cherry-pick the JTL C++ changes into your Core3 codebase yourself
+- **Add or update Lua scripts** — ship templates, space zones, JTL screenplays, and any other Lua additions are your responsibility
+- **Modify TRE files** — client-side assets (ship appearances, space zones, string tables, CRC registrations) must be added separately
+- **Upgrade your codebase** — this tool assumes your server already compiles and runs with the JTL code changes in place
+
+**The workflow is:** update your code first (C++, Lua, TRE), make sure it all compiles, **then** use this tool to convert your database so existing objects are compatible with the new code.
+
+---
+
 ## The Problem
 
 SWGEmu stores all game objects (players, buildings, items, creatures) as serialized C++ objects in Berkeley DB. When the server code changes — renamed fields, new fields, removed fields, different class hierarchies — the bytes stored in BDB no longer match what the current code expects.
