@@ -33,6 +33,21 @@
  *   make dbconvert -j24
  */
 
+// ─── Core3 compatibility check ──────────────────────────────────────────────
+// dbconvert requires specific Core3 source changes to work correctly.
+// If this fails, your Core3 needs updating — pull the latest and rebuild.
+// See docs/CORE3_CHANGES.md for details.
+#include "server/zone/dbconvert_compat.h"
+
+#ifndef DBCONVERT_CORE3_COMPAT
+#error "Your Core3 is out of date — it's missing changes that dbconvert needs. Run 'git pull' in your Core3 repo, then try building again. See docs/CORE3_CHANGES.md for details."
+#endif
+
+#if DBCONVERT_CORE3_COMPAT < 1
+#error "Your Core3 dbconvert support is too old for this version. Run 'git pull' in your Core3 repo, then try building again. See docs/CORE3_CHANGES.md for details."
+#endif
+// ─────────────────────────────────────────────────────────────────────────────
+
 #include "server/zone/objects/creature/CreatureObject.h"
 #include "server/zone/objects/scene/SceneObject.h"
 #include "server/zone/objects/building/BuildingObject.h"

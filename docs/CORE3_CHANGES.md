@@ -1,12 +1,42 @@
 # Required Core3 Source Changes
 
-dbconvert requires modifications to Core3 and engine3 source files beyond the 4 engine3 patches and the autogen patch. These changes fall into three categories:
+dbconvert requires modifications to Core3 and engine3 source files beyond the 4 engine3 patches and the autogen patch. These changes fall into four categories:
 
+0. **Compatibility header** — `dbconvert_compat.h` version gate (compile-time check)
 1. **Engine3 infrastructure** — `Core::MANAGED_REFERENCE_LOAD` static bool and ManagedReference short-circuits
 2. **Crash guards** — Early returns in `initializeTransientMembers()` / `notifyLoadFromDatabase()` to prevent crashes when server infrastructure (ORB, ZoneServer, managers) doesn't exist
 3. **Data preservation** — Cached values that survive the deserialize→reserialize round-trip when manager lookups return null
 
 Without these changes, dbconvert will either crash or silently destroy data (skills, abilities, template CRCs, zone names, creature templates).
+
+---
+
+## Compatibility Header (Required First)
+
+dbconvert checks this header at compile time. If it's missing, the build fails with a friendly message telling you to update your Core3.
+
+### `src/server/zone/dbconvert_compat.h`
+
+Create this file:
+
+```cpp
+#ifndef DBCONVERT_COMPAT_H_
+#define DBCONVERT_COMPAT_H_
+
+#define DBCONVERT_CORE3_COMPAT 1
+
+#endif // DBCONVERT_COMPAT_H_
+```
+
+### `src/server/zone/objects/scene/SceneObjectImplementation.cpp`
+
+Add the include near the top (after the existing SceneObject.h include):
+
+```cpp
+#include "server/zone/dbconvert_compat.h"
+```
+
+**Why:** This is the compile-time version gate. If you try to build dbconvert without this header, you'll get a clear error message instead of a binary that silently destroys your database.
 
 ---
 

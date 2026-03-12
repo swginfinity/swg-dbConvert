@@ -64,13 +64,36 @@ if [ ! -f "$SRC_DIR/CMakeLists.txt" ]; then
     exit 1
 fi
 
-# Check engine3 is clean
+# Check engine3 is clean — patches need a clean tree to apply and revert safely
 ENGINE3_STATUS=$(cd "$ENGINE3_DIR" && git status --porcelain 2>/dev/null || true)
 if [ -n "$ENGINE3_STATUS" ]; then
-    echo "ERROR: engine3 has uncommitted changes. Please commit or stash them first."
-    echo "$ENGINE3_STATUS"
+    echo ""
+    echo "================================================================"
+    echo "  engine3 has uncommitted changes — can't patch safely"
+    echo "================================================================"
+    echo ""
+    echo "  dbconvert needs to temporarily patch engine3 and revert when"
+    echo "  done. That only works on a clean tree."
+    echo ""
+    echo "  Dirty files:"
+    echo "$ENGINE3_STATUS" | sed 's/^/    /'
+    echo ""
+    echo "  To fix this, update your engine3 to the latest:"
+    echo ""
+    echo "    cd $ENGINE3_DIR"
+    echo "    git checkout ."
+    echo "    git pull"
+    echo ""
+    echo "  Nobody should be customizing engine3 — if you've forked it,"
+    echo "  you'll need to get back in sync with upstream first."
+    echo ""
+    echo "================================================================"
     exit 1
 fi
+
+# Check engine3 is up to date enough for our patches
+ENGINE3_COMMIT=$(cd "$ENGINE3_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+echo "  engine3 commit: $ENGINE3_COMMIT"
 
 echo "=== Building dbconvert ==="
 echo "  MMOCoreORB:  $MMOCOREORB"
@@ -132,9 +155,21 @@ for patch in "$PATCHES_DIR"/0*.patch; do
         echo "  Applied: $PATCH_NAME"
         PATCH_COUNT=$((PATCH_COUNT + 1))
     else
-        echo "  WARNING: Patch does not apply cleanly: $PATCH_NAME"
-        echo "  This may mean the patch is already applied or engine3 has changed."
-        echo "  Aborting to avoid partial patches."
+        echo ""
+        echo "================================================================"
+        echo "  Patch failed: $PATCH_NAME"
+        echo "================================================================"
+        echo ""
+        echo "  This usually means your engine3 is out of date."
+        echo ""
+        echo "  Update it:"
+        echo ""
+        echo "    cd $ENGINE3_DIR"
+        echo "    git pull"
+        echo ""
+        echo "  Then try building dbconvert again."
+        echo ""
+        echo "================================================================"
         exit 1
     fi
 done
