@@ -12,21 +12,21 @@
  *   Phase 4: finalize   — BDB checkpoint, clean environment for core3
  *
  * Modes:
- *   classic: hashfix all records, then reserialize all records (safe fallback)
- *   smart:   hashfix all records with metadata scan, probe per class,
- *            only reserialize classes where bytes actually changed
+ *   smart (default): hashfix with metadata scan, probe per class,
+ *                    only reserialize classes where bytes actually changed
+ *   classic:         hashfix all records, then reserialize all records (safe fallback)
  *
  * Phase gates enforce ordering — each phase writes a manifest and the next
  * phase refuses to run without it. Prevents running out of order.
  *
  * Usage:
- *   ./dbconvert all                  - run all phases (classic)
- *   ./dbconvert all --smart          - run all phases (smart)
+ *   ./dbconvert all                  - run all phases (smart, default)
+ *   ./dbconvert all --classic        - run all phases (classic)
  *   ./dbconvert clean                - Phase 1 only
- *   ./dbconvert hashfix              - Phase 2 only
- *   ./dbconvert hashfix --smart      - Phase 2 with metadata scan
- *   ./dbconvert reserialize          - Phase 3 classic (all records)
- *   ./dbconvert reserialize --smart  - Phase 3 smart (probe + selective)
+ *   ./dbconvert hashfix              - Phase 2 with metadata scan (default)
+ *   ./dbconvert hashfix --classic    - Phase 2 hash replacement only
+ *   ./dbconvert reserialize          - Phase 3 smart (probe + selective, default)
+ *   ./dbconvert reserialize --classic - Phase 3 classic (all records)
  *   ./dbconvert finalize             - Phase 4 only
  *
  * Build:
@@ -1222,12 +1222,12 @@ int main(int argc, char* argv[]) {
 
 	// Parse arguments
 	String subCmd;
-	bool smartMode = false;
+	bool smartMode = true;
 
 	for (int i = 1; i < argc; ++i) {
 		String arg = argv[i];
-		if (arg == "--smart" || arg == "-s") {
-			smartMode = true;
+		if (arg == "--classic" || arg == "-c") {
+			smartMode = false;
 		} else if (subCmd.isEmpty()) {
 			subCmd = arg.toLowerCase();
 		}
@@ -1237,22 +1237,22 @@ int main(int argc, char* argv[]) {
 		System::out << "SWGEmu Database Converter — 4-Phase Pipeline" << endl;
 		System::out << endl;
 		System::out << "Full pipeline:" << endl;
-		System::out << "  ./dbconvert all                  Run all phases (classic)" << endl;
-		System::out << "  ./dbconvert all --smart          Run all phases (smart, selective reserialize)" << endl;
+		System::out << "  ./dbconvert all                  Run all phases (smart mode, default)" << endl;
+		System::out << "  ./dbconvert all --classic        Run all phases (classic, reserialize everything)" << endl;
 		System::out << endl;
 		System::out << "Individual phases (clean always runs automatically first):" << endl;
-		System::out << "  ./dbconvert hashfix              Phase 2: Byte-level hash replacement" << endl;
-		System::out << "  ./dbconvert hashfix --smart      Phase 2: Hash replacement + metadata scan" << endl;
-		System::out << "  ./dbconvert reserialize          Phase 3: C++ round-trip (all records)" << endl;
-		System::out << "  ./dbconvert reserialize --smart  Phase 3: C++ round-trip (selective)" << endl;
+		System::out << "  ./dbconvert hashfix              Phase 2: Hash replacement + metadata scan" << endl;
+		System::out << "  ./dbconvert hashfix --classic    Phase 2: Hash replacement only (no metadata)" << endl;
+		System::out << "  ./dbconvert reserialize          Phase 3: C++ round-trip (selective, default)" << endl;
+		System::out << "  ./dbconvert reserialize --classic  Phase 3: C++ round-trip (all records)" << endl;
 		System::out << "  ./dbconvert finalize             Phase 4: BDB checkpoint, prepare for core3" << endl;
 		System::out << endl;
 		System::out << "Phase gates: each phase requires the previous phase to be complete." << endl;
 		System::out << "Use 'all' to run the full pipeline automatically." << endl;
 		System::out << endl;
-		System::out << "The --smart flag enables per-class probing: Phase 2 collects metadata," << endl;
-		System::out << "Phase 3 probes 40 records per class (first 20 + last 20), and only" << endl;
-		System::out << "reserializes classes where bytes actually differ after hash fix." << endl;
+		System::out << "Smart mode (default) probes 40 records per class (first 20 + last 20)" << endl;
+		System::out << "and only reserializes classes where bytes actually differ. Use --classic" << endl;
+		System::out << "to force a full reserialize of every record (safe fallback)." << endl;
 		_exit(1);
 	}
 

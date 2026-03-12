@@ -63,8 +63,8 @@ Phase 4: finalize    BDB checkpoint, remove __db.*, prepare for core3
 
 Two modes are available:
 
-- **Classic** — hashfix all records, then reserialize all records. Safe fallback, converts everything.
-- **Smart** — hashfix all records with metadata scan, probe per class, only reserialize classes where bytes actually differ. On a typical production database, this reduces reserialize work by 90%+.
+- **Smart (default)** — hashfix all records with metadata scan, probe per class, only reserialize classes where bytes actually differ. On a typical production database, this reduces reserialize work by 90%+.
+- **Classic** (`--classic`) — hashfix all records, then reserialize all records. Safe fallback if smart mode gives unexpected results.
 
 ### Phase 1: Clean
 
@@ -102,7 +102,7 @@ The hash replacements:
 
 **Why hash fix must come first:** Without fixing hashes, `readObject()` can't find renamed fields by their old hash codes. The data silently reads as zeros. When `writeObject()` then saves the object, coordinates are permanently zeroed — all objects end up at 0,0,0.
 
-In **smart mode** (`--smart`), Phase 2 also extracts per-class metadata during the same scan pass:
+In **smart mode** (the default), Phase 2 also extracts per-class metadata during the same scan pass:
 - `_className` for each record
 - Coordinate values (`posX`, `posZ`) via `MAX(ABS())` per class
 - First 20 and last 20 OIDs per class (quorum probe candidates for Phase 3)
@@ -169,8 +169,8 @@ make -j$(nproc)
 
 # 4. Stop core3 if running, then convert
 cd /path/to/MMOCoreORB/bin
-./dbconvert all              # Classic mode (safe, converts everything)
-./dbconvert all --smart      # Smart mode (probes per class, skips unchanged)
+./dbconvert all              # Smart mode (default — probes per class, skips unchanged)
+./dbconvert all --classic    # Classic mode (fallback — reserialize everything)
 
 # 5. Start the server — zero dirty objects on first boot
 ./core3
@@ -228,8 +228,8 @@ The autogen patches (`if (Core::MANAGED_REFERENCE_LOAD) initializeTransientMembe
 ### Full Pipeline
 
 ```bash
-./dbconvert all                 # Phases 1-2-3-4, classic mode
-./dbconvert all --smart         # Phases 1-2-3-4, smart mode
+./dbconvert all                 # Phases 1-2-3-4, smart mode (default)
+./dbconvert all --classic       # Phases 1-2-3-4, classic mode (fallback)
 ```
 
 Runs all four phases in order. If interrupted, re-run the same command — Phase 3 skips already-converted databases via `.converted` manifest files.
@@ -240,10 +240,10 @@ Each phase can be run independently. Phase gates enforce ordering: each phase re
 
 ```bash
 ./dbconvert clean               # Phase 1: Strip LSNs, clean environment
-./dbconvert hashfix             # Phase 2: Byte-level hash replacement
-./dbconvert hashfix --smart     # Phase 2: Hash replacement + metadata scan
-./dbconvert reserialize         # Phase 3: Classic (all records)
-./dbconvert reserialize --smart # Phase 3: Smart (probe + selective)
+./dbconvert hashfix             # Phase 2: Hash replacement + metadata scan (default)
+./dbconvert hashfix --classic   # Phase 2: Hash replacement only (no metadata)
+./dbconvert reserialize         # Phase 3: Smart (probe + selective, default)
+./dbconvert reserialize --classic # Phase 3: Classic (all records)
 ./dbconvert finalize            # Phase 4: Checkpoint + cleanup
 ```
 
@@ -257,14 +257,14 @@ Running phases individually is useful for:
 If conversion is interrupted (crash, Ctrl+C, power loss), re-run the same command:
 
 ```bash
-./dbconvert all --smart
+./dbconvert all
 ```
 
 Already-converted databases are tracked via `.converted` manifest files and automatically skipped. To force re-conversion of a specific database, delete its manifest and re-run Phase 3:
 
 ```bash
 rm databases/sceneobjects.converted
-./dbconvert reserialize --smart
+./dbconvert reserialize
 ```
 
 ---
@@ -440,14 +440,14 @@ Memory usage stays constant regardless of database size.
 ### Smart Mode Data Flow
 
 ```
-Phase 2 (hashfix --smart)
+Phase 2 (hashfix, smart mode default)
   |
   | For each record: extract _className, coordinates, OID
   | Build ClassInfo per class:
   |   - count, maxAbsX, maxAbsZ
   |   - first 20 OIDs, last 20 OIDs (ring buffer)
   v
-Phase 3 (reserialize --smart)
+Phase 3 (reserialize, smart mode default)
   |
   | For each class: load probe OIDs (first 20 + last 20)
   |   Load -> reserialize -> compare bytes with BDB
