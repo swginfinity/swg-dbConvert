@@ -91,9 +91,46 @@ if [ -n "$ENGINE3_STATUS" ]; then
     exit 1
 fi
 
-# Check engine3 is up to date enough for our patches
-ENGINE3_COMMIT=$(cd "$ENGINE3_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-echo "  engine3 commit: $ENGINE3_COMMIT"
+# Check engine3 is new enough — patches require at least this commit
+MIN_ENGINE3_COMMIT="339da044e9cf68e7fd23edf11b3e106e96cfb78d"
+MIN_ENGINE3_SHORT="339da044"
+ENGINE3_COMMIT=$(cd "$ENGINE3_DIR" && git rev-parse HEAD 2>/dev/null || echo "unknown")
+ENGINE3_SHORT=$(cd "$ENGINE3_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+if [ "$ENGINE3_COMMIT" = "unknown" ]; then
+    echo ""
+    echo "================================================================"
+    echo "  Can't determine engine3 version"
+    echo "================================================================"
+    echo ""
+    echo "  engine3 doesn't appear to be a git repository."
+    echo "  dbconvert needs engine3 at commit $MIN_ENGINE3_SHORT or later."
+    echo ""
+    echo "================================================================"
+    exit 1
+fi
+
+if ! (cd "$ENGINE3_DIR" && git merge-base --is-ancestor "$MIN_ENGINE3_COMMIT" HEAD 2>/dev/null); then
+    echo ""
+    echo "================================================================"
+    echo "  engine3 is out of date"
+    echo "================================================================"
+    echo ""
+    echo "  Your engine3 is at:  $ENGINE3_SHORT"
+    echo "  Minimum required:    $MIN_ENGINE3_SHORT"
+    echo ""
+    echo "  Update it:"
+    echo ""
+    echo "    cd $ENGINE3_DIR"
+    echo "    git pull"
+    echo ""
+    echo "  Then try building dbconvert again."
+    echo ""
+    echo "================================================================"
+    exit 1
+fi
+
+echo "  engine3 commit: $ENGINE3_SHORT (ok)"
 
 echo "=== Building dbconvert ==="
 echo "  MMOCoreORB:  $MMOCOREORB"
