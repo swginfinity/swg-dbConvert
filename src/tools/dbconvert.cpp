@@ -29,6 +29,9 @@
  *   ./dbconvert reserialize --classic - Phase 3 classic (all records)
  *   ./dbconvert finalize             - Phase 4 only
  *
+ * Flags:
+ *   --preserve-errors    Keep invalid records instead of deleting them (old behavior)
+ *
  * Build:
  *   make dbconvert -j24
  */
@@ -154,6 +157,7 @@ struct ClassInfo {
 // ─── Error Logging ──────────────────────────────────────────────────────────
 
 static FILE* errorLog = nullptr;
+static FILE* purgeLog = nullptr;
 
 static void openErrorLog() {
 	char logPath[512];
@@ -168,6 +172,20 @@ static void openErrorLog() {
 	}
 }
 
+static void openPurgeLog() {
+	char logPath[512];
+	snprintf(logPath, sizeof(logPath), "%s/dbconvert_purged.log", DB_DIR);
+	purgeLog = fopen(logPath, "w");
+	if (purgeLog) {
+		time_t now = time(nullptr);
+		fprintf(purgeLog, "# SWGEmu Database Converter - Purged Records Log\n");
+		fprintf(purgeLog, "# Records deleted because they failed to deserialize\n");
+		fprintf(purgeLog, "# Started: %s", ctime(&now));
+		fprintf(purgeLog, "#\n");
+		fflush(purgeLog);
+	}
+}
+
 static void logError(const char* database, uint64 oid, const char* className, const char* message) {
 	printf("  ERROR [%s] OID=0x%016llx class=%s: %s\n",
 		database, (unsigned long long)oid, className, message);
@@ -175,6 +193,16 @@ static void logError(const char* database, uint64 oid, const char* className, co
 		fprintf(errorLog, "[%s] OID=0x%016llx class=%s error=%s\n",
 			database, (unsigned long long)oid, className, message);
 		fflush(errorLog);
+	}
+}
+
+static void logPurge(const char* database, uint64 oid, const char* className, const char* reason) {
+	printf("  PURGE [%s] OID=0x%016llx class=%s: %s\n",
+		database, (unsigned long long)oid, className, reason);
+	if (purgeLog) {
+		fprintf(purgeLog, "[%s] OID=0x%016llx class=%s reason=%s\n",
+			database, (unsigned long long)oid, className, reason);
+		fflush(purgeLog);
 	}
 }
 
@@ -192,6 +220,16 @@ static void closeErrorLog(uint64 totalErrors) {
 		fprintf(errorLog, "# Finished: %s", ctime(&now));
 		fclose(errorLog);
 		errorLog = nullptr;
+	}
+}
+
+static void closePurgeLog(uint64 totalPurged) {
+	if (purgeLog) {
+		time_t now = time(nullptr);
+		fprintf(purgeLog, "#\n# Total purged: %llu\n", (unsigned long long)totalPurged);
+		fprintf(purgeLog, "# Finished: %s", ctime(&now));
+		fclose(purgeLog);
+		purgeLog = nullptr;
 	}
 }
 
@@ -795,9 +833,14 @@ static bool probeRecord(ObjectDatabase* database, ObjectManager* objManager, uin
 }
 
 static int phaseReserialize(bool smartMode,
-	std::unordered_map<std::string, std::unordered_map<std::string, ClassInfo>>* allClassMaps) {
+	std::unordered_map<std::string, std::unordered_map<std::string, ClassInfo>>* allClassMaps,
+	bool preserveErrors = false) {
 
 	if (!requirePhase(MANIFEST_PHASE2, "Phase 2 (hashfix)")) return 1;
+
+	// Default: delete records that fail to deserialize (purge mode).
+	// --preserve-errors keeps the old behavior: leave broken records in place.
+	bool purgeInvalid = !preserveErrors;
 
 	System::out << "================================================================" << endl;
 	System::out << "  Phase 3: Reserialize (C++ round-trip)" << endl;
@@ -805,6 +848,10 @@ static int phaseReserialize(bool smartMode,
 		System::out << "  Mode:    Smart (quorum probe, selective reserialize)" << endl;
 	else
 		System::out << "  Mode:    Classic (all records)" << endl;
+	if (purgeInvalid)
+		System::out << "  Purge:   ON (invalid records will be deleted and logged)" << endl;
+	else
+		System::out << "  Purge:   OFF (--preserve-errors: invalid records kept)" << endl;
 	System::out << "================================================================" << endl << endl;
 
 	// Initialize engine if not already done
@@ -813,6 +860,8 @@ static int phaseReserialize(bool smartMode,
 	ObjectDatabaseManager* dbManager = ObjectDatabaseManager::instance();
 
 	openErrorLog();
+	if (purgeInvalid)
+		openPurgeLog();
 
 	auto databases = discoverDatabases();
 	if (databases.empty()) {
@@ -821,7 +870,7 @@ static int phaseReserialize(bool smartMode,
 	}
 
 	Time overallStart;
-	uint64 grandReserialized = 0, grandSkipped = 0, grandErrors = 0;
+	uint64 grandReserialized = 0, grandSkipped = 0, grandErrors = 0, grandPurged = 0;
 
 	for (size_t dbIdx = 0; dbIdx < databases.size(); dbIdx++) {
 		String currentDb = databases[dbIdx].name;
@@ -910,7 +959,7 @@ static int phaseReserialize(bool smartMode,
 					FILE* manifest = fopen(manifestPath.toCharArray(), "w");
 					if (manifest) {
 						Time now;
-						fprintf(manifest, "converted=%llu\nreserialized=0\nskipped=%llu\nmode=smart\n",
+						fprintf(manifest, "converted=%llu\nreserialized=0\nskipped=%llu\npurged=0\nerrors=0\nmode=smart\n",
 							(unsigned long long)now.getMiliTime(), (unsigned long long)totalRecords);
 						fclose(manifest);
 					}
@@ -934,7 +983,7 @@ static int phaseReserialize(bool smartMode,
 		System::out << "  " << totalObjects << " records to process" << endl;
 
 		// ── Reserialize ──
-		uint64 converted = 0, skipped = 0, errors = 0;
+		uint64 converted = 0, skipped = 0, errors = 0, purged = 0;
 		Time reserStart;
 		Vector<uint64> batchOids;
 
@@ -950,15 +999,15 @@ static int phaseReserialize(bool smartMode,
 					skipped++;
 					// Progress (less frequent for skipped records)
 					if (skipped % 10000 == 0) {
-						uint64 processed = converted + skipped + errors;
+						uint64 processed = converted + skipped + errors + purged;
 						double elapsed = reserStart.miliDifference() / 1000.0;
 						double rate = elapsed > 0 ? processed / elapsed : 0;
 						char etaBuf[64];
 						formatETA(totalObjects - processed, rate, etaBuf, sizeof(etaBuf));
-						printf("\r    %llu/%llu :: %llu converted :: %llu skipped :: %llu errors :: ETA %s          ",
+						printf("\r    %llu/%llu :: %llu converted :: %llu skipped :: %llu purged :: %llu errors :: ETA %s          ",
 							(unsigned long long)processed, (unsigned long long)totalObjects,
 							(unsigned long long)converted, (unsigned long long)skipped,
-							(unsigned long long)errors, etaBuf);
+							(unsigned long long)purged, (unsigned long long)errors, etaBuf);
 						fflush(stdout);
 					}
 					continue;
@@ -980,22 +1029,43 @@ static int phaseReserialize(bool smartMode,
 					converted++;
 				} else {
 					String className = extractClassName(database, oid);
-					logError(currentDb.toCharArray(), oid, className.toCharArray(),
-						"loadPersistentObject returned null (unregistered class?)");
-					errors++;
+					if (purgeInvalid) {
+						logPurge(currentDb.toCharArray(), oid, className.toCharArray(),
+							"loadPersistentObject returned null (unregistered class?)");
+						database->deleteData(oid, nullptr);
+						purged++;
+					} else {
+						logError(currentDb.toCharArray(), oid, className.toCharArray(),
+							"loadPersistentObject returned null (unregistered class?)");
+						errors++;
+					}
 				}
 			} catch (const Exception& e) {
 				String className = extractClassName(database, oid);
 				StringBuffer msg;
 				msg << e.getMessage();
-				logError(currentDb.toCharArray(), oid, className.toCharArray(),
-					msg.toString().toCharArray());
-				errors++;
+				if (purgeInvalid) {
+					logPurge(currentDb.toCharArray(), oid, className.toCharArray(),
+						msg.toString().toCharArray());
+					database->deleteData(oid, nullptr);
+					purged++;
+				} else {
+					logError(currentDb.toCharArray(), oid, className.toCharArray(),
+						msg.toString().toCharArray());
+					errors++;
+				}
 			} catch (...) {
 				String className = extractClassName(database, oid);
-				logError(currentDb.toCharArray(), oid, className.toCharArray(),
-					"unknown exception (possible corrupt data)");
-				errors++;
+				if (purgeInvalid) {
+					logPurge(currentDb.toCharArray(), oid, className.toCharArray(),
+						"unknown exception (possible corrupt data)");
+					database->deleteData(oid, nullptr);
+					purged++;
+				} else {
+					logError(currentDb.toCharArray(), oid, className.toCharArray(),
+						"unknown exception (possible corrupt data)");
+					errors++;
+				}
 			}
 
 			// Batch commit + DOB eviction
@@ -1011,7 +1081,7 @@ static int phaseReserialize(bool smartMode,
 			}
 
 			// Progress
-			uint64 processed = converted + skipped + errors;
+			uint64 processed = converted + skipped + errors + purged;
 			if (processed % 500 == 0 || processed == totalObjects) {
 				double elapsed = reserStart.miliDifference() / 1000.0;
 				double rate = elapsed > 0 ? processed / elapsed : 0;
@@ -1019,14 +1089,14 @@ static int phaseReserialize(bool smartMode,
 				formatETA(totalObjects - processed, rate, etaBuf, sizeof(etaBuf));
 
 				if (smartMode) {
-					printf("\r    %llu/%llu :: %llu converted :: %llu skipped :: %llu errors :: ETA %s          ",
+					printf("\r    %llu/%llu :: %llu converted :: %llu skipped :: %llu purged :: %llu errors :: ETA %s          ",
 						(unsigned long long)processed, (unsigned long long)totalObjects,
 						(unsigned long long)converted, (unsigned long long)skipped,
-						(unsigned long long)errors, etaBuf);
+						(unsigned long long)purged, (unsigned long long)errors, etaBuf);
 				} else {
-					printf("\r    %llu/%llu :: %.0f/s :: %llu errors :: ETA %s          ",
-						(unsigned long long)(converted + errors), (unsigned long long)totalObjects,
-						rate, (unsigned long long)errors, etaBuf);
+					printf("\r    %llu/%llu :: %.0f/s :: %llu purged :: %llu errors :: ETA %s          ",
+						(unsigned long long)(converted + errors + purged), (unsigned long long)totalObjects,
+						rate, (unsigned long long)purged, (unsigned long long)errors, etaBuf);
 				}
 				fflush(stdout);
 			}
@@ -1047,20 +1117,22 @@ static int phaseReserialize(bool smartMode,
 		char elapsedBuf[64];
 		formatElapsed(reserElapsed, elapsedBuf, sizeof(elapsedBuf));
 
-		printf("\r    %llu converted, %llu skipped, %llu errors in %s                              \n",
+		printf("\r    %llu converted, %llu skipped, %llu purged, %llu errors in %s                              \n",
 			(unsigned long long)converted, (unsigned long long)skipped,
-			(unsigned long long)errors, elapsedBuf);
+			(unsigned long long)purged, (unsigned long long)errors, elapsedBuf);
 
 		grandReserialized += converted;
 		grandSkipped += skipped;
 		grandErrors += errors;
+		grandPurged += purged;
 
 		// Log summary
 		{
 			char buf[256];
-			snprintf(buf, sizeof(buf), "[%s] reserialized=%llu skipped=%llu errors=%llu",
+			snprintf(buf, sizeof(buf), "[%s] reserialized=%llu skipped=%llu purged=%llu errors=%llu",
 				currentDb.toCharArray(), (unsigned long long)converted,
-				(unsigned long long)skipped, (unsigned long long)errors);
+				(unsigned long long)skipped, (unsigned long long)purged,
+				(unsigned long long)errors);
 			logSummary(buf);
 		}
 
@@ -1070,10 +1142,11 @@ static int phaseReserialize(bool smartMode,
 			FILE* manifest = fopen(mPath.toCharArray(), "w");
 			if (manifest) {
 				Time now;
-				fprintf(manifest, "converted=%llu\nreserialized=%llu\nskipped=%llu\nerrors=%llu\nmode=%s\n",
+				fprintf(manifest, "converted=%llu\nreserialized=%llu\nskipped=%llu\npurged=%llu\nerrors=%llu\nmode=%s\n",
 					(unsigned long long)now.getMiliTime(),
 					(unsigned long long)converted, (unsigned long long)skipped,
-					(unsigned long long)errors, smartMode ? "smart" : "classic");
+					(unsigned long long)purged, (unsigned long long)errors,
+					smartMode ? "smart" : "classic");
 				fclose(manifest);
 			}
 		}
@@ -1090,13 +1163,18 @@ static int phaseReserialize(bool smartMode,
 	System::out << "  Reserialize complete" << endl;
 	System::out << "  Converted:   " << grandReserialized << endl;
 	System::out << "  Skipped:     " << grandSkipped << endl;
+	if (grandPurged > 0)
+		System::out << "  Purged:      " << grandPurged << endl;
 	System::out << "  Errors:      " << grandErrors << endl;
 	System::out << "  Elapsed:     " << elapsed << endl;
 	if (grandErrors > 0)
 		System::out << "  Error log:   " << DB_DIR << "/dbconvert_errors.log" << endl;
+	if (grandPurged > 0)
+		System::out << "  Purge log:   " << DB_DIR << "/dbconvert_purged.log" << endl;
 	System::out << "================================================================" << endl;
 
 	closeErrorLog(grandErrors);
+	closePurgeLog(grandPurged);
 	// Note: Do NOT call objManager->shutdown() here — Phase 4 needs
 	// the ObjectDatabaseManager alive for checkpoint. _exit() in main
 	// handles cleanup.
@@ -1104,9 +1182,10 @@ static int phaseReserialize(bool smartMode,
 	// Write phase 3 manifest
 	char manifestContent[512];
 	snprintf(manifestContent, sizeof(manifestContent),
-		"reserialized=%llu\nskipped=%llu\nerrors=%llu\nmode=%s\n",
+		"reserialized=%llu\nskipped=%llu\npurged=%llu\nerrors=%llu\nmode=%s\n",
 		(unsigned long long)grandReserialized, (unsigned long long)grandSkipped,
-		(unsigned long long)grandErrors, smartMode ? "smart" : "classic");
+		(unsigned long long)grandPurged, (unsigned long long)grandErrors,
+		smartMode ? "smart" : "classic");
 	writeManifest(MANIFEST_PHASE3, manifestContent);
 
 	System::out << "  Wrote " << MANIFEST_PHASE3 << endl;
@@ -1223,11 +1302,14 @@ int main(int argc, char* argv[]) {
 	// Parse arguments
 	String subCmd;
 	bool smartMode = true;
+	bool preserveErrors = false;
 
 	for (int i = 1; i < argc; ++i) {
 		String arg = argv[i];
 		if (arg == "--classic" || arg == "-c") {
 			smartMode = false;
+		} else if (arg == "--preserve-errors") {
+			preserveErrors = true;
 		} else if (subCmd.isEmpty()) {
 			subCmd = arg.toLowerCase();
 		}
@@ -1250,6 +1332,14 @@ int main(int argc, char* argv[]) {
 		System::out << "Phase gates: each phase requires the previous phase to be complete." << endl;
 		System::out << "Use 'all' to run the full pipeline automatically." << endl;
 		System::out << endl;
+		System::out << "Options:" << endl;
+		System::out << "  --classic            Force full reserialize of every record (safe fallback)" << endl;
+		System::out << "  --preserve-errors    Keep invalid records in the database instead of deleting them" << endl;
+		System::out << endl;
+		System::out << "By default, records that fail to deserialize (unregistered class, corrupt data," << endl;
+		System::out << "invalid CRC) are deleted from the database and logged to dbconvert_purged.log." << endl;
+		System::out << "Use --preserve-errors to keep them (old behavior)." << endl;
+		System::out << endl;
 		System::out << "Smart mode (default) probes 40 records per class (first 20 + last 20)" << endl;
 		System::out << "and only reserializes classes where bytes actually differ. Use --classic" << endl;
 		System::out << "to force a full reserialize of every record (safe fallback)." << endl;
@@ -1266,6 +1356,7 @@ int main(int argc, char* argv[]) {
 			System::out << "================================================================" << endl;
 			System::out << "  SWGEmu Database Converter" << endl;
 			System::out << "  Mode: " << (smartMode ? "Smart (selective reserialize)" : "Classic (full reserialize)") << endl;
+			System::out << "  Purge: " << (preserveErrors ? "OFF (--preserve-errors)" : "ON (invalid records will be deleted)") << endl;
 			System::out << "  Running all phases: clean → hashfix → reserialize → finalize" << endl;
 			System::out << "================================================================" << endl;
 			System::out << endl;
@@ -1280,7 +1371,7 @@ int main(int argc, char* argv[]) {
 			if (ret != 0) { System::out << "Pipeline aborted at Phase 2." << endl; _exit(ret); }
 			System::out << endl;
 
-			ret = phaseReserialize(smartMode, smartMode ? &allClassMaps : nullptr);
+			ret = phaseReserialize(smartMode, smartMode ? &allClassMaps : nullptr, preserveErrors);
 			if (ret != 0) { System::out << "Pipeline aborted at Phase 3." << endl; _exit(ret); }
 			System::out << endl;
 
@@ -1374,7 +1465,7 @@ int main(int argc, char* argv[]) {
 				System::out << endl;
 			}
 
-			ret = phaseReserialize(smartMode, smartMode ? &allClassMaps : nullptr);
+			ret = phaseReserialize(smartMode, smartMode ? &allClassMaps : nullptr, preserveErrors);
 
 		} else if (subCmd == "finalize") {
 			ret = phaseClean();

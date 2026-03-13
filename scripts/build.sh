@@ -110,24 +110,39 @@ if [ "$ENGINE3_COMMIT" = "unknown" ]; then
     exit 1
 fi
 
+# The minimum commit date of 339da044 (2024-02-21). Used as fallback when
+# engine3 upstream was rebased and the original commit hash no longer exists
+# in the current history.
+MIN_ENGINE3_DATE="2024-02-21"
+
 if ! (cd "$ENGINE3_DIR" && git merge-base --is-ancestor "$MIN_ENGINE3_COMMIT" HEAD 2>/dev/null); then
-    echo ""
-    echo "================================================================"
-    echo "  engine3 is out of date"
-    echo "================================================================"
-    echo ""
-    echo "  Your engine3 is at:  $ENGINE3_SHORT"
-    echo "  Minimum required:    $MIN_ENGINE3_SHORT"
-    echo ""
-    echo "  Update it:"
-    echo ""
-    echo "    cd $ENGINE3_DIR"
-    echo "    git pull"
-    echo ""
-    echo "  Then try building dbconvert again."
-    echo ""
-    echo "================================================================"
-    exit 1
+    # Ancestor check failed — commit may not exist if engine3 was rebased.
+    # Fall back to comparing HEAD's commit date against the minimum date.
+    HEAD_DATE=$(cd "$ENGINE3_DIR" && git log -1 --format='%cs' HEAD 2>/dev/null || echo "")
+
+    if [ -z "$HEAD_DATE" ] || [[ "$HEAD_DATE" < "$MIN_ENGINE3_DATE" ]]; then
+        echo ""
+        echo "================================================================"
+        echo "  engine3 is out of date"
+        echo "================================================================"
+        echo ""
+        echo "  Your engine3 is at:  $ENGINE3_SHORT ($HEAD_DATE)"
+        echo "  Minimum required:    $MIN_ENGINE3_SHORT ($MIN_ENGINE3_DATE)"
+        echo ""
+        echo "  Update it:"
+        echo ""
+        echo "    cd $ENGINE3_DIR"
+        echo "    git pull"
+        echo ""
+        echo "  Then try building dbconvert again."
+        echo ""
+        echo "================================================================"
+        exit 1
+    fi
+
+    echo "  Note: engine3 commit $MIN_ENGINE3_SHORT not in history (upstream may"
+    echo "  have been rebased), but HEAD date ($HEAD_DATE) is recent enough."
+    echo "  Proceeding."
 fi
 
 echo "  engine3 commit: $ENGINE3_SHORT (ok)"
